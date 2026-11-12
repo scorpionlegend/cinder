@@ -17,3 +17,9 @@ path = "src/main.rs"
 cinder-adapter = { path = "../cinder-adapter" }
 cinder-adapter-mock = { path = "../cinder-adapter-mock" }
 cinder-core = { path = "../cinder-core" }
+cinder-adapter-cef = { path = "../cinder-adapter-cef", optional = true }
+
+[features]
+# Links the real web engine. Off by default so a plain `cargo build` needs no
+# CEF headers; `cargo build -p cinder-cli --features cef` turns it on.
+cef = ["dep:cinder-adapter-cef"]

@@ -89,6 +89,7 @@ pub fn ensure_loaded(runtime: &Path) {
         return;
     };
     let status = std::process::Command::new(exe)
+        .args(std::env::args_os().skip(1))
         .env(
             "LD_LIBRARY_PATH",
             format!("{}:{}", runtime.display(), current),

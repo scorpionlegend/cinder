@@ -57,6 +57,7 @@ name = "cinder-cli"
 version = "0.1.0"
 dependencies = [
  "cinder-adapter",
+ "cinder-adapter-cef",
  "cinder-adapter-mock",
  "cinder-core",
 ]

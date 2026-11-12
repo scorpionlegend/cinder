@@ -13,11 +13,19 @@ use cinder_adapter_mock::MockEngine;
 use cinder_core::{Browser, Effect, NavigationOutcome};
 
 fn main() {
+    // CEF re-executes this binary for its subprocesses; they must exit before
+    // any argument parsing so a helper process never runs a command.
+    #[cfg(feature = "cef")]
+    if let Some(code) = cinder_adapter_cef::Cef::execute_process() {
+        std::process::exit(code);
+    }
+
     let args: Vec<String> = std::env::args().skip(1).collect();
     let command = args.first().map(String::as_str).unwrap_or("help");
 
     let code = match command {
         "demo" => run_demo(),
+        "browse" => run_browse(args.get(1).map(String::as_str)),
         "version" | "--version" | "-V" => {
             println!("cinder {} (adapter api 0.1)", env!("CARGO_PKG_VERSION"));
             0
@@ -32,6 +40,10 @@ fn main() {
             2
         }
     };
+    // `std::process::exit` skips destructors, so a piped stdout buffer would be
+    // dropped and the report lost. Flush it explicitly.
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
     std::process::exit(code);
 }
 
@@ -40,10 +52,15 @@ fn print_help() {
     println!();
     println!("USAGE:");
     println!("  cinder demo      run a scripted session: tabs, policy, decisions, restore, shutdown");
+    println!("  cinder browse <url>  load a real page in the CEF web engine");
     println!("  cinder version   print the version");
     println!("  cinder help      this text");
     println!();
-    println!("No native engine is linked in this build; the CEF-backed adapter is not implemented yet.");
+    if cfg!(feature = "cef") {
+        println!("This build links the CEF web engine; `browse` drives it.");
+    } else {
+        println!("This build has no web engine: `browse` needs --features cef.");
+    }
 }
 
 fn run_demo() -> i32 {
@@ -238,8 +255,121 @@ fn run_demo() -> i32 {
     0
 }
 
-fn describe(effect: &Effect) -> String {
-    match effect {
+#[cfg(feature = "cef")]
+fn run_browse(target: Option<&str>) -> i32 {
+    use cinder_adapter_cef::{CefEngine, CefEngineConfig};
+
+    let Some(target) = target else {
+        eprintln!("usage: cinder browse <url>");
+        return 2;
+    };
+    let url = match Url::parse(target) {
+        Ok(u) => u,
+        Err(e) => {
+            eprintln!("invalid url {target}: {e}");
+            return 2;
+        }
+    };
+
+    let staged = cinder_adapter_cef::prepare_runtime(&cinder_adapter_cef::cef_root());
+    let config = CefEngineConfig {
+        resources_dir: staged.clone(),
+        locales_dir: staged.join("locales"),
+        cache_dir: std::env::temp_dir().join("cinder-browse-cache"),
+        extra_args: vec![
+            "--disable-gpu".into(),
+            "--disable-gpu-compositing".into(),
+            "--disable-software-rasterizer".into(),
+            "--disable-dev-shm-usage".into(),
+            "--ozone-platform=headless".into(),
+        ],
+        capabilities: cinder_adapter_cef::measured_capabilities(),
+    };
+    println!("web engine : CEF {}", cinder_adapter_cef::Cef::version());
+    println!("resources  : {}", config.resources_dir.display());
+
+    let engine = match CefEngine::new(config) {
+        Ok(e) => Arc::new(e),
+        Err(e) => {
+            eprintln!("engine did not start: {e}");
+            return 1;
+        }
+    };
+
+    let policy = Arc::new(PolicySnapshot::new(1).with_https_upgrade(true));
+    let mut browser = match Browser::new(engine, policy, "/tmp/cinder-browse-profile") {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("failed to start orchestrator: {e}");
+            return 1;
+        }
+    };
+
+    let window = browser.open_window();
+    let tab = match browser.open_tab(window, Some(url.clone())) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("could not open tab: {e}");
+            return 1;
+        }
+    };
+    println!("tab        : {tab} -> {}", url.as_str());
+
+    // Pump until the load settles. The first network request in a fresh
+    // profile waits for Chromium's network service, so allow a generous window.
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let mut settled = false;
+    while std::time::Instant::now() < deadline {
+        for effect in browser.pump() {
+            println!("  {}", describe(&effect));
+            if matches!(
+                effect,
+                Effect::LoadFinished { .. } | Effect::LoadFailed { .. }
+            ) {
+                settled = true;
+            }
+        }
+        if settled {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    match browser.tab(tab) {
+        Some(t) => {
+            println!("\ntitle      : {}", t.display_title());
+            println!("url        : {}", t.display_url());
+        }
+        None => println!("\ntab is gone"),
+    }
+    if !settled {
+        eprintln!("load did not settle within 60s");
+    }
+
+    match browser.shutdown(Duration::from_secs(5)) {
+        Ok(report) => println!(
+            "shutdown   : forced={} remaining={} complete={}",
+            report.forced_closed, report.remaining, report.shutdown_complete
+        ),
+        Err(e) => {
+            eprintln!("shutdown failed: {e}");
+            return 1;
+        }
+    }
+    if settled {
+        0
+    } else {
+        1
+    }
+}
+
+#[cfg(not(feature = "cef"))]
+fn run_browse(_target: Option<&str>) -> i32 {
+    eprintln!("this build has no web engine; rebuild with --features cef");
+    2
+}
+
+fn describe(effect: &Effect) -> String {    match effect {
         Effect::TabOpened(tab) => format!("{tab} opened"),
         Effect::TabClosed(tab) => format!("{tab} closed"),
         Effect::CloseRequested(tab) => format!("{tab} page requested close"),
