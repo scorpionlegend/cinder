@@ -85,6 +85,18 @@ jobs:
           --version ${{ env.CINDER_VERSION }}
           --formats ${{ matrix.formats }}
 
+      # A cross build cannot be executed on the runner, so at least prove the
+      # binary really is the architecture the bundle claims to be.
+      - name: Verify bundle architecture
+        if: ${{ matrix.cross }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p verify && tar -xzf dist/cinder-*.tar.gz -C verify
+          archs=$(lipo -archs verify/cinder-*/Cinder.app/Contents/MacOS/cinder)
+          echo "bundle archs: $archs"
+          [[ "$archs" == *arm64* ]]
+
       - name: Smoke test the bundle
         if: ${{ !matrix.cross }}
         shell: bash
