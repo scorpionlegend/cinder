@@ -725,14 +725,26 @@ static int configure_api_version(void) {
   return 1;
 }
 
+/* cef_main_args_t carries argc/argv on POSIX but only the module instance on
+ * Windows, so the fields have to be filled per platform. */
+static void fill_main_args(cef_main_args_t* args, int argc, char** argv) {
+  memset(args, 0, sizeof(*args));
+#ifdef _WIN32
+  (void)argc;
+  (void)argv;
+  args->instance = GetModuleHandleW(NULL);
+#else
+  args->argc = argc;
+  args->argv = argv;
+#endif
+}
+
 int cinder_cef_execute_process(int argc, char** argv) {
   cef_main_args_t args;
   if (!configure_api_version()) {
     return -1;
   }
-  memset(&args, 0, sizeof(args));
-  args.argc = argc;
-  args.argv = argv;
+  fill_main_args(&args, argc, argv);
   return cef_execute_process(&args, &g_app, NULL);
 }
 
@@ -741,9 +753,7 @@ int cinder_cef_init(int argc, char** argv, const char* resources_dir,
   cef_main_args_t args;
   cef_settings_t settings;
 
-  memset(&args, 0, sizeof(args));
-  args.argc = argc;
-  args.argv = argv;
+  fill_main_args(&args, argc, argv);
 
   memset(&settings, 0, sizeof(settings));
   settings.size = sizeof(cef_settings_t);
