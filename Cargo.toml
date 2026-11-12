@@ -6,6 +6,7 @@ members = [
     "crates/cinder-adapter-mock",
     "crates/cinder-core",
     "crates/cinder-cli",
+    "crates/cinder-dist",
 ]
 
 [workspace.package]

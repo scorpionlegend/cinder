@@ -10,10 +10,11 @@ typed adapter boundary.
 
 ## Status
 
-Early implementation of the adapter contract and the Cinder-side model. **No
-native engine is linked in yet**: the CEF-backed adapter (L0/L1) is not
-implemented, so nothing here renders a web page. What exists is the part that
-carries forward unchanged once CEF is wired in.
+Early implementation. The typed adapter, the orchestrator, the mock engine and
+the CEF-backed adapter (L0/L1) exist, and the CEF off-screen render spike passes.
+**There is no browser window yet**: no windowing layer, no chrome UI, no tab
+strip, so nothing here is a usable browser. What exists is the boundary and the
+Cinder-side model that carry forward unchanged once the window layer lands.
 
 | Crate | Role |
 | --- | --- |
@@ -22,9 +23,45 @@ carries forward unchanged once CEF is wired in.
 | `crates/cinder-core` | L3 orchestrator: windows, tabs, history, decision routing, session snapshot/restore, shutdown escalation |
 | `crates/cinder-adapter-cef` | L0/L1 CEF adapter: flat C shim over the CEF C API, plus the `cef-spike` binary |
 | `crates/cinder-cli` | `cinder` binary that drives the orchestrator against the mock engine |
+| `crates/cinder-dist` | Packager: bundles the binaries with the pinned CEF runtime and writes the platform archives |
 
 `unsafe` is forbidden in every crate except `cinder-adapter-cef`, the audited
 native boundary (L0/L1), so the boundary cannot quietly grow elsewhere.
+
+## Downloads
+
+Every supported target gets a self-contained package: the Cinder binaries plus
+the pinned CEF runtime, so nothing has to be installed separately.
+
+| Target | Artifact |
+| --- | --- |
+| Windows x86_64 | `cinder-<version>-x86_64-pc-windows-msvc.zip` |
+| macOS x86_64 / arm64 | `cinder-<version>-<triple>.tar.gz` containing `Cinder.app` |
+| Linux x86_64 / arm64 | `cinder-<version>-<triple>.tar.gz` and `cinder_<version>_<arch>.deb` |
+| Fedora / RHEL / openSUSE | `cinder-<version>-1.<arch>.rpm`, built from the same Linux bundle |
+
+The portable tarball is the fallback that works on any glibc distribution; the
+`.deb` and `.rpm` only add desktop-entry and `PATH` integration.
+
+`crates/cinder-dist` builds these. It streams the runtime straight from the CEF
+distribution into the archive, so packaging does not need a staging copy:
+
+```sh
+cargo build --release -p cinder-cli -p cinder-adapter-cef
+cargo run -p cinder-dist --release -- \
+  --target x86_64-unknown-linux-gnu --cef-root ~/cef --out dist
+```
+
+CEF is pinned per platform in `packaging/cef-pin.json` (version, file name and
+published SHA-1); `packaging/fetch-cef.py` downloads and verifies it. `.github/workflows/release.yml`
+runs the matrix on five runners and publishes a GitHub Release with `SHA256SUMS`
+when a `v*` tag is pushed.
+
+Measured on the Linux x86_64 build: 237 files, `cinder-0.1.0-x86_64-unknown-linux-gnu.tar.gz`
+at 164,377,098 bytes and `cinder_0.1.0_amd64.deb` at 163,748,796 bytes. The
+pinned CEF beta ships an unstripped `libcef.so` of 1,492,848,720 bytes;
+`cinder-dist` strips debug sections by default, which takes it to 284,777,632
+bytes, and records that in the manifest (`--no-strip-cef` disables it).
 
 ## CEF spike: measured
 
