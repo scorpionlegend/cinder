@@ -11,11 +11,16 @@
  */
 #include "cinder_cef_shim.h"
 
-#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <pthread.h>
 #include <unistd.h>
+#endif
 
 #include "include/capi/cef_app_capi.h"
 #include "include/capi/cef_browser_capi.h"
@@ -65,8 +70,25 @@ static int g_blocked_count = 0;
 static int g_upgrade_https = 0;
 
 /* Guards the policy copy and the browser→view lookup, both of which are read
- * from CEF's IO thread while the engine thread mutates them. */
-static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
+ * from CEF's IO thread while the engine thread mutates them.
+ *
+ * MSVC has no <pthread.h>, so the lock is a thin wrapper over a slim reader/
+ * writer lock on Windows and a pthread mutex elsewhere. */
+#ifdef _WIN32
+typedef SRWLOCK cinder_lock_t;
+#define CINDER_LOCK_INIT SRWLOCK_INIT
+static void lock_acquire(cinder_lock_t* l) { AcquireSRWLockExclusive(l); }
+static void lock_release(cinder_lock_t* l) { ReleaseSRWLockExclusive(l); }
+static void sleep_ms(unsigned ms) { Sleep(ms); }
+#else
+typedef pthread_mutex_t cinder_lock_t;
+#define CINDER_LOCK_INIT PTHREAD_MUTEX_INITIALIZER
+static void lock_acquire(cinder_lock_t* l) { pthread_mutex_lock(l); }
+static void lock_release(cinder_lock_t* l) { pthread_mutex_unlock(l); }
+static void sleep_ms(unsigned ms) { usleep(ms * 1000u); }
+#endif
+
+static cinder_lock_t g_lock = CINDER_LOCK_INIT;
 
 static void set_error(const char* msg) {
   snprintf(g_error, sizeof(g_error), "%s", msg ? msg : "");
@@ -176,12 +198,12 @@ static cinder_view_t* view_by_browser(struct _cef_browser_t* browser) {
 static int view_id_by_browser(struct _cef_browser_t* browser) {
   cinder_view_t* v;
   int id = 0;
-  pthread_mutex_lock(&g_lock);
+  lock_acquire(&g_lock);
   v = view_by_browser(browser);
   if (v) {
     id = v->id;
   }
-  pthread_mutex_unlock(&g_lock);
+  lock_release(&g_lock);
   return id;
 }
 
@@ -563,10 +585,10 @@ static cef_return_value_t CEF_CALLBACK resource_on_before_resource_load(
   }
   url_host(url, host, sizeof(host));
   /* Runs on the IO thread, so the policy copy is taken under the lock. */
-  pthread_mutex_lock(&g_lock);
+  lock_acquire(&g_lock);
   blocked = host_is_blocked(host);
   upgrade = g_upgrade_https;
-  pthread_mutex_unlock(&g_lock);
+  lock_release(&g_lock);
 
   if (blocked) {
     emit(view_id_by_browser(browser), CINDER_CEF_EV_BLOCKED, url, NULL);
@@ -992,7 +1014,7 @@ int cinder_cef_set_policy(const char* const* blocked_hosts, int count,
     set_error("blocked host count out of range");
     return 0;
   }
-  pthread_mutex_lock(&g_lock);
+  lock_acquire(&g_lock);
   g_blocked_count = 0;
   for (i = 0; i < count; i++) {
     if (!blocked_hosts[i]) {
@@ -1003,7 +1025,7 @@ int cinder_cef_set_policy(const char* const* blocked_hosts, int count,
     g_blocked_count++;
   }
   g_upgrade_https = upgrade_https ? 1 : 0;
-  pthread_mutex_unlock(&g_lock);
+  lock_release(&g_lock);
   return 1;
 }
 
@@ -1011,7 +1033,7 @@ void cinder_cef_pump(int ms) {
   int elapsed = 0;
   while (elapsed < ms) {
     cef_do_message_loop_work();
-    usleep(1000);
+    sleep_ms(1);
     elapsed += 1;
   }
 }
