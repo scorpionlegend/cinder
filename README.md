@@ -71,7 +71,7 @@ compiler checks the shim against the real headers on every build. The spike
 creates one windowless browser, waits for a painted frame, and writes it as a
 PPM.
 
-Result of the recorded run (`cargo run -p cinder-adapter-cef --bin cef-spike`):
+Result of the recorded run (`CINDER_CEF_ROOT=~/cef cargo run -p cinder-adapter-cef --bin cef-spike`):
 
 | Measurement | Value |
 | --- | --- |
@@ -103,10 +103,26 @@ constraints: `icudtl.dat` and the `.pak` files must sit next to `libcef.so`, and
 
 ## Try it
 
+`cinder-adapter-cef` needs the CEF headers and runtime at build time, so a fresh
+clone builds and tests everything else first:
+
 ```sh
-cargo test --workspace
+cargo test --workspace --exclude cinder-adapter-cef
 cargo run -p cinder-cli -- demo
 ```
+
+To include the CEF crate, fetch the pinned distribution (SHA-1 verified) and
+point the build at it:
+
+```sh
+python3 packaging/fetch-cef.py --platform linux64 --dest ~/cef
+CINDER_CEF_ROOT=~/cef cargo test --workspace
+CINDER_CEF_ROOT=~/cef cargo run -p cinder-adapter-cef --bin cef-spike
+```
+
+Without `CINDER_CEF_ROOT` the CEF crate's build script stops with an explicit
+error instead of silently building a stub, so a missing runtime can never be
+mistaken for a working one.
 
 The demo opens tabs, applies a policy snapshot (host blocklist, HTTPS upgrade),
 answers a permission request, saves and restores a session, and shuts down —
