@@ -4,8 +4,10 @@ Release:        1%{?dist}
 Summary:        Cinder web browser
 License:        Apache-2.0
 URL:            https://github.com/scorpionlegend/cinder
-# The payload is the portable Linux bundle produced by `cinder-dist`.
-Source0:        %{name}-%{version}-%{_target_cpu}.tar.gz
+# The payload is the portable Linux bundle produced by `cinder-dist`. The
+# bundle name carries the full version string, which may include a pre-release
+# suffix that is illegal in the Version tag, so it is passed separately.
+Source0:        %{name}-%{_cinder_version}-%{_target_cpu}.tar.gz
 AutoReqProv:    no
 BuildArch:      %{_cinder_arch}
 

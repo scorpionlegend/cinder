@@ -131,12 +131,24 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq rpm
           version=$(python3 -c "import json,glob;print(json.load(open(glob.glob('dist/*.manifest.json')[0]))['version'])")
+          # rpm forbids '-' in the Version tag, so a pre-release suffix moves
+          # into Release: 0.1.0-pre.1 -> Version 0.1.0, Release pre.1.1.
+          rpm_version=${version%%-*}
+          if [ "$rpm_version" = "$version" ]; then
+            rpm_release=1
+          else
+            rpm_release="${version#*-}.1"
+          fi
+          echo "rpm version=$rpm_version release=$rpm_release bundle=$version"
           mkdir -p rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
-          cp dist/cinder-${version}-x86_64-unknown-linux-gnu.tar.gz \
-             rpmbuild/SOURCES/cinder-${version}-x86_64.tar.gz
-          rpmbuild -bb packaging/linux/cinder.spec \
+          cp "dist/cinder-${version}-x86_64-unknown-linux-gnu.tar.gz" \
+             "rpmbuild/SOURCES/cinder-${version}-x86_64.tar.gz"
+          sed -e "s|^Version:.*|Version:        ${rpm_version}|" \
+              -e "s|^Release:.*|Release:        ${rpm_release}%{?dist}|" \
+              packaging/linux/cinder.spec > rpmbuild/SPECS/cinder.spec
+          rpmbuild -bb rpmbuild/SPECS/cinder.spec \
             --define "_topdir $(pwd)/rpmbuild" \
-            --define "version ${version}" \
+            --define "_cinder_version ${version}" \
             --define "_cinder_arch x86_64" \
             --define "_cinder_root cinder-${version}-x86_64-unknown-linux-gnu" \
             --define "_cinder_desktop $(pwd)/packaging/linux/cinder.desktop" \
