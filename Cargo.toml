@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/cinder-adapter",
+    "crates/cinder-adapter-cef",
     "crates/cinder-adapter-mock",
     "crates/cinder-core",
     "crates/cinder-cli",
