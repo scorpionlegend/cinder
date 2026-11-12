@@ -120,6 +120,17 @@ CINDER_CEF_ROOT=~/cef cargo test --workspace
 CINDER_CEF_ROOT=~/cef cargo run -p cinder-adapter-cef --bin cef-spike
 ```
 
+The `cinder` binary links the real web engine only when built with the `cef`
+feature, so the default build stays free of CEF headers:
+
+```sh
+CINDER_CEF_ROOT=~/cef cargo run -p cinder-cli --features cef -- browse https://example.com/
+```
+
+That loads the page in Chromium, prints the title and URL the orchestrator
+observed, and shuts the engine down. Without the feature `cinder browse` exits 2
+with a message saying so.
+
 Without `CINDER_CEF_ROOT` the CEF crate's build script stops with an explicit
 error instead of silently building a stub, so a missing runtime can never be
 mistaken for a working one.
