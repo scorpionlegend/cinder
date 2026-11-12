@@ -1,0 +1,29 @@
+{
+  "cef_version": "158.0.1+g6ee3fb9+chromium-158.0.8127.18",
+  "chromium_version": "158.0.8127.18",
+  "api_version": 15800,
+  "channel": "beta",
+  "note": "Pinned CEF binary distributions. sha1 values are the ones published in https://cef-builds.spotifycdn.com/index.json for the minimal build of each platform.",
+  "platforms": {
+    "linux64": {
+      "file": "cef_binary_158.0.1+g6ee3fb9+chromium-158.0.8127.18_linux64_beta_minimal.tar.bz2",
+      "sha1": "7b8f5ecdbdc4a785402c455103e81c52b6812c74"
+    },
+    "linuxarm64": {
+      "file": "cef_binary_158.0.1+g6ee3fb9+chromium-158.0.8127.18_linuxarm64_beta_minimal.tar.bz2",
+      "sha1": "ab500e83a17601e31fd8947598680c459d46494f"
+    },
+    "macosx64": {
+      "file": "cef_binary_158.0.1+g6ee3fb9+chromium-158.0.8127.18_macosx64_beta_minimal.tar.bz2",
+      "sha1": "b378daa6c30e45fe76eaaa4e5b16def2166c4462"
+    },
+    "macosarm64": {
+      "file": "cef_binary_158.0.1+g6ee3fb9+chromium-158.0.8127.18_macosarm64_beta_minimal.tar.bz2",
+      "sha1": "6890ed21e1755606b9ae5abd9bd06abe2342d73e"
+    },
+    "windows64": {
+      "file": "cef_binary_158.0.1+g6ee3fb9+chromium-158.0.8127.18_windows64_beta_minimal.tar.bz2",
+      "sha1": "e15703b63c365cf0997cd62099599a7a37ddd8f0"
+    }
+  }
+}
