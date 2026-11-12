@@ -3,10 +3,15 @@
  * Design notes:
  *  - Only the C API is used, so libcef_dll_wrapper (C++) is not needed at all.
  *  - Every handler is a static struct with a plain refcount; CEF add_refs them.
- *  - One browser, one frame buffer, one thread. No callbacks into Rust.
+ *  - Views are a fixed table addressed by caller-supplied ids. Handlers map a
+ *    cef_browser_t* back to its view by pointer, so no thread-local state and
+ *    no per-view handler allocation is needed.
+ *  - Events leave through one callback. The shim never calls into Rust except
+ *    there, and never blocks waiting for an answer.
  */
 #include "cinder_cef_shim.h"
 
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -19,6 +24,7 @@
 #include "include/capi/cef_life_span_handler_capi.h"
 #include "include/capi/cef_load_handler_capi.h"
 #include "include/capi/cef_render_handler_capi.h"
+#include "include/capi/cef_request_handler_capi.h"
 #include "include/cef_api_hash.h"
 #include "include/cef_version.h"
 #include "include/internal/cef_string.h"
@@ -26,18 +32,50 @@
 
 /* ---------------------------------------------------------------- state --- */
 
-static int g_state = 0;
-static int g_width = 0;
-static int g_height = 0;
-static unsigned char* g_frame = NULL;
-static size_t g_frame_cap = 0;
-static char g_title[512] = {0};
-static char g_url[2048] = {0};
+#define CINDER_CEF_MAX_VIEWS 32
+#define CINDER_CEF_MAX_BLOCKED_HOSTS 128
+
+typedef struct {
+  int id;
+  int used;
+  int state;
+  int width;
+  int height;
+  int browser_id;
+  unsigned char* frame;
+  size_t frame_cap;
+  char title[512];
+  char url[2048];
+  cef_browser_t* browser;
+} cinder_view_t;
+
+static cinder_view_t g_views[CINDER_CEF_MAX_VIEWS];
+static int g_primary_view = -1;
+/* Index of the view whose browser is being created. CEF reports the browser
+ * pointer only in on_after_created, and creation is serialized on the engine
+ * thread, so one slot is enough. */
+static int g_pending_view = -1;
 static char g_error[512] = {0};
-static cef_browser_t* g_browser = NULL;
+
+static cinder_cef_event_fn g_event_cb = NULL;
+static void* g_event_user = NULL;
+
+static char g_blocked_hosts[CINDER_CEF_MAX_BLOCKED_HOSTS][256];
+static int g_blocked_count = 0;
+static int g_upgrade_https = 0;
+
+/* Guards the policy copy and the browser→view lookup, both of which are read
+ * from CEF's IO thread while the engine thread mutates them. */
+static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static void set_error(const char* msg) {
   snprintf(g_error, sizeof(g_error), "%s", msg ? msg : "");
+}
+
+static void emit(int view_id, int kind, const char* a, const char* b) {
+  if (g_event_cb) {
+    g_event_cb(g_event_user, view_id, kind, a ? a : "", b ? b : "");
+  }
 }
 
 /* ------------------------------------------------------------ refcounts --- */
@@ -74,6 +112,8 @@ static int g_render_refs = 1;
 static int g_life_refs = 1;
 static int g_load_refs = 1;
 static int g_display_refs = 1;
+static int g_request_refs = 1;
+static int g_resource_refs = 1;
 
 DEFINE_REFCOUNT(app, g_app_refs)
 DEFINE_REFCOUNT(client, g_client_refs)
@@ -81,6 +121,8 @@ DEFINE_REFCOUNT(render, g_render_refs)
 DEFINE_REFCOUNT(life, g_life_refs)
 DEFINE_REFCOUNT(load, g_load_refs)
 DEFINE_REFCOUNT(display, g_display_refs)
+DEFINE_REFCOUNT(request, g_request_refs)
+DEFINE_REFCOUNT(resource, g_resource_refs)
 
 /* --------------------------------------------------------------- strings --- */
 
@@ -96,20 +138,114 @@ static void to_utf8(const cef_string_t* src, char* dst, size_t cap) {
   }
 }
 
+/* ----------------------------------------------------------- view table --- */
+
+static cinder_view_t* view_by_id(int view_id) {
+  int i;
+  for (i = 0; i < CINDER_CEF_MAX_VIEWS; i++) {
+    if (g_views[i].used && g_views[i].id == view_id) {
+      return &g_views[i];
+    }
+  }
+  return NULL;
+}
+
+static cinder_view_t* view_by_browser(struct _cef_browser_t* browser) {
+  int i;
+  int browser_id;
+  if (!browser) {
+    return NULL;
+  }
+  /* CEF does not promise the same cef_browser_t* instance in every callback,
+   * so the pointer is tried first and the stable browser identifier second. */
+  for (i = 0; i < CINDER_CEF_MAX_VIEWS; i++) {
+    if (g_views[i].used && g_views[i].browser == browser) {
+      return &g_views[i];
+    }
+  }
+  browser_id = browser->get_identifier(browser);
+  for (i = 0; i < CINDER_CEF_MAX_VIEWS; i++) {
+    if (g_views[i].used && g_views[i].browser_id == browser_id) {
+      return &g_views[i];
+    }
+  }
+  return NULL;
+}
+
+/* Same lookup, safe to call from CEF's IO thread. Returns 0 when unknown. */
+static int view_id_by_browser(struct _cef_browser_t* browser) {
+  cinder_view_t* v;
+  int id = 0;
+  pthread_mutex_lock(&g_lock);
+  v = view_by_browser(browser);
+  if (v) {
+    id = v->id;
+  }
+  pthread_mutex_unlock(&g_lock);
+  return id;
+}
+
+static cinder_view_t* view_alloc(int view_id) {
+  int i;
+  for (i = 0; i < CINDER_CEF_MAX_VIEWS; i++) {
+    if (!g_views[i].used) {
+      memset(&g_views[i], 0, sizeof(g_views[i]));
+      g_views[i].used = 1;
+      g_views[i].id = view_id;
+      if (g_primary_view < 0) {
+        g_primary_view = i;
+      }
+      return &g_views[i];
+    }
+  }
+  return NULL;
+}
+
+static void view_release_frame(cinder_view_t* v) {
+  if (!v) {
+    return;
+  }
+  free(v->frame);
+  v->frame = NULL;
+  v->frame_cap = 0;
+}
+
+static cef_browser_host_t* acquire_host(cef_browser_t* browser) {
+  if (!browser) {
+    return NULL;
+  }
+  return browser->get_host(browser);
+}
+
+static void release_host(cef_browser_host_t* host) {
+  if (host) {
+    host->base.release(&host->base);
+  }
+}
+
+static void release_frame(cef_frame_t* frame) {
+  if (frame) {
+    frame->base.release(&frame->base);
+  }
+}
+
 /* ------------------------------------------------------- render handler --- */
 
 static void CEF_CALLBACK render_get_view_rect(struct _cef_render_handler_t* self,
                                               struct _cef_browser_t* browser,
                                               cef_rect_t* rect) {
+  cinder_view_t* v = view_by_browser(browser);
   (void)self;
-  (void)browser;
   if (!rect) {
     return;
   }
+  if (!v && g_pending_view >= 0) {
+    v = &g_views[g_pending_view];
+  }
   rect->x = 0;
   rect->y = 0;
-  rect->width = g_width;
-  rect->height = g_height;
+  rect->width = v ? v->width : 0;
+  rect->height = v ? v->height : 0;
 }
 
 static int CEF_CALLBACK render_get_screen_info(
@@ -137,28 +273,29 @@ static void CEF_CALLBACK render_on_paint(struct _cef_render_handler_t* self,
                                          const void* buffer,
                                          int width,
                                          int height) {
+  cinder_view_t* v = view_by_browser(browser);
   (void)self;
-  (void)browser;
   (void)dirty_count;
   (void)dirty_rects;
-  if (type != PET_VIEW || !buffer || width <= 0 || height <= 0) {
+  if (!v || type != PET_VIEW || !buffer || width <= 0 || height <= 0) {
     return;
   }
 
   size_t needed = (size_t)width * (size_t)height * 4u;
-  if (needed > g_frame_cap) {
-    unsigned char* grown = (unsigned char*)realloc(g_frame, needed);
+  if (needed > v->frame_cap) {
+    unsigned char* grown = (unsigned char*)realloc(v->frame, needed);
     if (!grown) {
       set_error("frame buffer allocation failed");
       return;
     }
-    g_frame = grown;
-    g_frame_cap = needed;
+    v->frame = grown;
+    v->frame_cap = needed;
   }
-  memcpy(g_frame, buffer, needed);
-  g_width = width;
-  g_height = height;
-  g_state |= CINDER_CEF_PAINTED;
+  memcpy(v->frame, buffer, needed);
+  v->width = width;
+  v->height = height;
+  v->state |= CINDER_CEF_PAINTED;
+  emit(v->id, CINDER_CEF_EV_PAINTED, NULL, NULL);
 }
 
 static cef_render_handler_t g_render_handler = {
@@ -177,25 +314,47 @@ static cef_render_handler_t g_render_handler = {
 static void CEF_CALLBACK life_on_after_created(
     struct _cef_life_span_handler_t* self,
     struct _cef_browser_t* browser) {
+  cinder_view_t* v;
   (void)self;
-  (void)browser;
-  g_state |= CINDER_CEF_CREATED;
+  if (g_pending_view < 0 || g_pending_view >= CINDER_CEF_MAX_VIEWS) {
+    return;
+  }
+  v = &g_views[g_pending_view];
+  g_pending_view = -1;
+  if (!v->used || !browser) {
+    return;
+  }
+  v->browser = browser;
+  v->browser_id = browser->get_identifier(browser);
+  v->state |= CINDER_CEF_CREATED;
+  emit(v->id, CINDER_CEF_EV_CREATED, v->url, NULL);
 }
 
 static int CEF_CALLBACK life_do_close(struct _cef_life_span_handler_t* self,
                                       struct _cef_browser_t* browser) {
+  cinder_view_t* v = view_by_browser(browser);
   (void)self;
-  (void)browser;
-  return 0; /* allow the close */
+  if (v) {
+    emit(v->id, CINDER_CEF_EV_CLOSE_REQUESTED, NULL, NULL);
+  }
+  /* Windowless rendering has no parent window to tear down, and CEF's docs are
+   * explicit: returning 1 here leaves the browser partially closed and
+   * on_before_close never runs. 0 destroys it immediately. */
+  return 0;
 }
 
 static void CEF_CALLBACK life_on_before_close(
     struct _cef_life_span_handler_t* self,
     struct _cef_browser_t* browser) {
+  cinder_view_t* v = view_by_browser(browser);
   (void)self;
-  (void)browser;
-  g_state |= CINDER_CEF_CLOSED;
-  g_browser = NULL;
+  if (!v) {
+    return;
+  }
+  v->state |= CINDER_CEF_CLOSED;
+  v->browser = NULL;
+  view_release_frame(v);
+  emit(v->id, CINDER_CEF_EV_CLOSED, NULL, NULL);
 }
 
 static int CEF_CALLBACK life_on_before_popup(
@@ -227,7 +386,7 @@ static int CEF_CALLBACK life_on_before_popup(
   (void)settings;
   (void)extra_info;
   (void)no_javascript_access;
-  return 1; /* block popups in the spike */
+  return 1; /* block popups until a tab model exists for them */
 }
 
 static cef_life_span_handler_t g_life_handler = {
@@ -250,13 +409,41 @@ static void CEF_CALLBACK load_on_loading_state_change(
     int isLoading,
     int canGoBack,
     int canGoForward) {
+  cinder_view_t* v = view_by_browser(browser);
   (void)self;
-  (void)browser;
   (void)canGoBack;
   (void)canGoForward;
-  if (!isLoading) {
-    g_state |= CINDER_CEF_LOADED;
+  if (!v) {
+    return;
   }
+  if (isLoading) {
+    v->state &= ~CINDER_CEF_LOADED;
+    emit(v->id, CINDER_CEF_EV_LOAD_START, v->url, NULL);
+  } else {
+    v->state |= CINDER_CEF_LOADED;
+    emit(v->id, CINDER_CEF_EV_LOAD_END, v->url, NULL);
+  }
+}
+
+static void CEF_CALLBACK load_on_load_error(
+    struct _cef_load_handler_t* self,
+    struct _cef_browser_t* browser,
+    struct _cef_frame_t* frame,
+    cef_errorcode_t errorCode,
+    const cef_string_t* errorText,
+    const cef_string_t* failedUrl) {
+  cinder_view_t* v = view_by_browser(browser);
+  char code[32];
+  char url[2048];
+  (void)self;
+  (void)frame;
+  (void)errorText;
+  if (!v) {
+    return;
+  }
+  snprintf(code, sizeof(code), "%d", (int)errorCode);
+  to_utf8(failedUrl, url, sizeof(url));
+  emit(v->id, CINDER_CEF_EV_LOAD_ERROR, code, url);
 }
 
 static cef_load_handler_t g_load_handler = {
@@ -266,6 +453,7 @@ static cef_load_handler_t g_load_handler = {
              .has_one_ref = load_has_one_ref,
              .has_at_least_one_ref = load_has_at_least_one_ref},
     .on_loading_state_change = load_on_loading_state_change,
+    .on_load_error = load_on_load_error,
 };
 
 /* ----------------------------------------------------- display handler --- */
@@ -275,19 +463,27 @@ static void CEF_CALLBACK display_on_address_change(
     struct _cef_browser_t* browser,
     struct _cef_frame_t* frame,
     const cef_string_t* url) {
+  cinder_view_t* v = view_by_browser(browser);
   (void)self;
-  (void)browser;
   (void)frame;
-  to_utf8(url, g_url, sizeof(g_url));
+  if (!v) {
+    return;
+  }
+  to_utf8(url, v->url, sizeof(v->url));
+  emit(v->id, CINDER_CEF_EV_URL, v->url, NULL);
 }
 
 static void CEF_CALLBACK display_on_title_change(
     struct _cef_display_handler_t* self,
     struct _cef_browser_t* browser,
     const cef_string_t* title) {
+  cinder_view_t* v = view_by_browser(browser);
   (void)self;
-  (void)browser;
-  to_utf8(title, g_title, sizeof(g_title));
+  if (!v) {
+    return;
+  }
+  to_utf8(title, v->title, sizeof(v->title));
+  emit(v->id, CINDER_CEF_EV_TITLE, v->title, NULL);
 }
 
 static cef_display_handler_t g_display_handler = {
@@ -298,6 +494,133 @@ static cef_display_handler_t g_display_handler = {
              .has_at_least_one_ref = display_has_at_least_one_ref},
     .on_address_change = display_on_address_change,
     .on_title_change = display_on_title_change,
+};
+
+/* ------------------------------------------------------ request handler --- */
+
+/* Lowercase host of an absolute URL, or "" when there is none. */
+static void url_host(const char* url, char* out, size_t cap) {
+  const char* p;
+  size_t n = 0;
+  out[0] = '\0';
+  if (!url) {
+    return;
+  }
+  p = strstr(url, "://");
+  if (!p) {
+    return;
+  }
+  p += 3;
+  while (*p && *p != '/' && *p != ':' && *p != '?' && *p != '#' && n + 1 < cap) {
+    out[n++] = (char)((*p >= 'A' && *p <= 'Z') ? *p + 32 : *p);
+    p++;
+  }
+  out[n] = '\0';
+}
+
+static int host_is_blocked(const char* host) {
+  int i;
+  size_t host_len = strlen(host);
+  if (host_len == 0) {
+    return 0;
+  }
+  for (i = 0; i < g_blocked_count; i++) {
+    size_t blocked_len = strlen(g_blocked_hosts[i]);
+    if (host_len == blocked_len && strcmp(host, g_blocked_hosts[i]) == 0) {
+      return 1;
+    }
+    if (host_len > blocked_len && host[host_len - blocked_len - 1] == '.' &&
+        strcmp(host + host_len - blocked_len, g_blocked_hosts[i]) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static cef_return_value_t CEF_CALLBACK resource_on_before_resource_load(
+    struct _cef_resource_request_handler_t* self,
+    struct _cef_browser_t* browser,
+    struct _cef_frame_t* frame,
+    struct _cef_request_t* request,
+    struct _cef_callback_t* callback) {
+  cef_string_userfree_t url_free;
+  char url[2048];
+  char host[256];
+  int blocked = 0;
+  int upgrade = 0;
+  (void)self;
+  (void)frame;
+  (void)callback;
+
+  if (!request) {
+    return RV_CONTINUE;
+  }
+  url_free = request->get_url(request);
+  url[0] = '\0';
+  if (url_free) {
+    to_utf8(url_free, url, sizeof(url));
+    cef_string_userfree_utf16_free(url_free);
+  }
+  url_host(url, host, sizeof(host));
+  /* Runs on the IO thread, so the policy copy is taken under the lock. */
+  pthread_mutex_lock(&g_lock);
+  blocked = host_is_blocked(host);
+  upgrade = g_upgrade_https;
+  pthread_mutex_unlock(&g_lock);
+
+  if (blocked) {
+    emit(view_id_by_browser(browser), CINDER_CEF_EV_BLOCKED, url, NULL);
+    return RV_CANCEL;
+  }
+
+  if (upgrade && strncmp(url, "http://", 7) == 0) {
+    char upgraded[2048];
+    cef_string_t upgraded_str = {0};
+    snprintf(upgraded, sizeof(upgraded), "https://%s", url + 7);
+    cef_string_from_utf8(upgraded, strlen(upgraded), &upgraded_str);
+    request->set_url(request, &upgraded_str);
+    cef_string_clear(&upgraded_str);
+  }
+  return RV_CONTINUE;
+}
+
+static cef_resource_request_handler_t g_resource_handler = {
+    .base = {.size = sizeof(cef_resource_request_handler_t),
+             .add_ref = resource_add_ref,
+             .release = resource_release,
+             .has_one_ref = resource_has_one_ref,
+             .has_at_least_one_ref = resource_has_at_least_one_ref},
+    .on_before_resource_load = resource_on_before_resource_load,
+};
+
+static struct _cef_resource_request_handler_t* CEF_CALLBACK
+request_get_resource_request_handler(
+    struct _cef_request_handler_t* self,
+    struct _cef_browser_t* browser,
+    struct _cef_frame_t* frame,
+    struct _cef_request_t* request,
+    int is_navigation,
+    int is_download,
+    const cef_string_t* request_initiator,
+    int* disable_default_handling) {
+  (void)self;
+  (void)browser;
+  (void)frame;
+  (void)request;
+  (void)is_navigation;
+  (void)is_download;
+  (void)request_initiator;
+  (void)disable_default_handling;
+  return &g_resource_handler;
+}
+
+static cef_request_handler_t g_request_handler = {
+    .base = {.size = sizeof(cef_request_handler_t),
+             .add_ref = request_add_ref,
+             .release = request_release,
+             .has_one_ref = request_has_one_ref,
+             .has_at_least_one_ref = request_has_at_least_one_ref},
+    .get_resource_request_handler = request_get_resource_request_handler,
 };
 
 /* -------------------------------------------------------------- client --- */
@@ -326,6 +649,12 @@ static struct _cef_display_handler_t* CEF_CALLBACK client_get_display_handler(
   return &g_display_handler;
 }
 
+static struct _cef_request_handler_t* CEF_CALLBACK client_get_request_handler(
+    struct _cef_client_t* self) {
+  (void)self;
+  return &g_request_handler;
+}
+
 static cef_client_t g_client = {
     .base = {.size = sizeof(cef_client_t),
              .add_ref = client_add_ref,
@@ -336,6 +665,7 @@ static cef_client_t g_client = {
     .get_life_span_handler = client_get_life_span_handler,
     .get_load_handler = client_get_load_handler,
     .get_render_handler = client_get_render_handler,
+    .get_request_handler = client_get_request_handler,
 };
 
 /* ---------------------------------------------------------------- app ---- */
@@ -426,18 +756,35 @@ int cinder_cef_init(int argc, char** argv, const char* resources_dir,
   return 1;
 }
 
-int cinder_cef_create_browser(const char* url, int width, int height) {
+void cinder_cef_set_event_callback(cinder_cef_event_fn cb, void* user_data) {
+  g_event_cb = cb;
+  g_event_user = user_data;
+}
+
+int cinder_cef_create_view(int view_id, const char* url, int width, int height) {
   cef_window_info_t window_info;
   cef_browser_settings_t browser_settings;
   cef_string_t url_str = {0};
+  cinder_view_t* v;
 
-  if (!url || width <= 0 || height <= 0) {
-    set_error("invalid browser arguments");
+  if (width <= 0 || height <= 0) {
+    set_error("invalid view size");
     return 0;
   }
-
-  g_width = width;
-  g_height = height;
+  if (view_by_id(view_id)) {
+    set_error("view id already in use");
+    return 0;
+  }
+  v = view_alloc(view_id);
+  if (!v) {
+    set_error("view table full");
+    return 0;
+  }
+  v->width = width;
+  v->height = height;
+  if (url) {
+    snprintf(v->url, sizeof(v->url), "%s", url);
+  }
 
   memset(&window_info, 0, sizeof(window_info));
   window_info.size = sizeof(cef_window_info_t);
@@ -451,15 +798,212 @@ int cinder_cef_create_browser(const char* url, int width, int height) {
   browser_settings.size = sizeof(cef_browser_settings_t);
   browser_settings.windowless_frame_rate = 30;
 
-  cef_string_from_utf8(url, strlen(url), &url_str);
+  cef_string_from_utf8(url ? url : "about:blank", strlen(url ? url : "about:blank"),
+                       &url_str);
 
-  int ok = cef_browser_host_create_browser(&window_info, &g_client, &url_str,
-                                           &browser_settings, NULL, NULL);
-  cef_string_clear(&url_str);
-  if (!ok) {
+  g_pending_view = (int)(v - g_views);
+  if (!cef_browser_host_create_browser(&window_info, &g_client, &url_str,
+                                       &browser_settings, NULL, NULL)) {
+    cef_string_clear(&url_str);
+    g_pending_view = -1;
+    v->used = 0;
     set_error("cef_browser_host_create_browser failed");
     return 0;
   }
+  cef_string_clear(&url_str);
+  return 1;
+}
+
+int cinder_cef_create_browser(const char* url, int width, int height) {
+  return cinder_cef_create_view(1, url, width, height);
+}
+
+int cinder_cef_close_view(int view_id, int force) {
+  cinder_view_t* v = view_by_id(view_id);
+  cef_browser_host_t* host;
+  if (!v || !v->browser) {
+    return 0;
+  }
+  host = acquire_host(v->browser);
+  if (!host) {
+    return 0;
+  }
+  host->close_browser(host, force ? 1 : 0);
+  release_host(host);
+  return 1;
+}
+
+int cinder_cef_navigate(int view_id, const char* url) {
+  cinder_view_t* v = view_by_id(view_id);
+  cef_frame_t* frame;
+  cef_string_t url_str = {0};
+  if (!v || !v->browser || !url) {
+    return 0;
+  }
+  frame = v->browser->get_main_frame(v->browser);
+  if (!frame) {
+    return 0;
+  }
+  cef_string_from_utf8(url, strlen(url), &url_str);
+  frame->load_url(frame, &url_str);
+  cef_string_clear(&url_str);
+  release_frame(frame);
+  return 1;
+}
+
+int cinder_cef_reload(int view_id) {
+  cinder_view_t* v = view_by_id(view_id);
+  if (!v || !v->browser) {
+    return 0;
+  }
+  v->browser->reload(v->browser);
+  return 1;
+}
+
+int cinder_cef_stop(int view_id) {
+  cinder_view_t* v = view_by_id(view_id);
+  if (!v || !v->browser) {
+    return 0;
+  }
+  v->browser->stop_load(v->browser);
+  return 1;
+}
+
+int cinder_cef_go_back(int view_id) {
+  cinder_view_t* v = view_by_id(view_id);
+  if (!v || !v->browser) {
+    return 0;
+  }
+  v->browser->go_back(v->browser);
+  return 1;
+}
+
+int cinder_cef_go_forward(int view_id) {
+  cinder_view_t* v = view_by_id(view_id);
+  if (!v || !v->browser) {
+    return 0;
+  }
+  v->browser->go_forward(v->browser);
+  return 1;
+}
+
+int cinder_cef_set_zoom(int view_id, double level) {
+  cinder_view_t* v = view_by_id(view_id);
+  cef_browser_host_t* host;
+  if (!v || !v->browser) {
+    return 0;
+  }
+  host = acquire_host(v->browser);
+  if (!host) {
+    return 0;
+  }
+  host->set_zoom_level(host, level);
+  release_host(host);
+  return 1;
+}
+
+int cinder_cef_set_mute(int view_id, int muted) {
+  cinder_view_t* v = view_by_id(view_id);
+  cef_browser_host_t* host;
+  if (!v || !v->browser) {
+    return 0;
+  }
+  host = acquire_host(v->browser);
+  if (!host) {
+    return 0;
+  }
+  host->set_audio_muted(host, muted ? 1 : 0);
+  release_host(host);
+  return 1;
+}
+
+int cinder_cef_find(int view_id, const char* query, int forward) {
+  cinder_view_t* v = view_by_id(view_id);
+  cef_browser_host_t* host;
+  cef_string_t query_str = {0};
+  if (!v || !v->browser || !query) {
+    return 0;
+  }
+  host = acquire_host(v->browser);
+  if (!host) {
+    return 0;
+  }
+  cef_string_from_utf8(query, strlen(query), &query_str);
+  host->find(host, &query_str, forward ? 1 : 0, 0, 0);
+  cef_string_clear(&query_str);
+  release_host(host);
+  return 1;
+}
+
+int cinder_cef_resize(int view_id, int width, int height) {
+  cinder_view_t* v = view_by_id(view_id);
+  cef_browser_host_t* host;
+  if (!v || width <= 0 || height <= 0) {
+    return 0;
+  }
+  v->width = width;
+  v->height = height;
+  if (!v->browser) {
+    return 1;
+  }
+  host = acquire_host(v->browser);
+  if (!host) {
+    return 0;
+  }
+  host->was_resized(host);
+  release_host(host);
+  return 1;
+}
+
+int cinder_cef_set_visible(int view_id, int visible) {
+  cinder_view_t* v = view_by_id(view_id);
+  cef_browser_host_t* host;
+  if (!v || !v->browser) {
+    return 0;
+  }
+  host = acquire_host(v->browser);
+  if (!host) {
+    return 0;
+  }
+  host->was_hidden(host, visible ? 0 : 1);
+  release_host(host);
+  return 1;
+}
+
+int cinder_cef_set_focus(int view_id, int focused) {
+  cinder_view_t* v = view_by_id(view_id);
+  cef_browser_host_t* host;
+  if (!v || !v->browser) {
+    return 0;
+  }
+  host = acquire_host(v->browser);
+  if (!host) {
+    return 0;
+  }
+  host->set_focus(host, focused ? 1 : 0);
+  release_host(host);
+  return 1;
+}
+
+int cinder_cef_set_policy(const char* const* blocked_hosts, int count,
+                          int upgrade_https) {
+  int i;
+  if (count < 0 || count > CINDER_CEF_MAX_BLOCKED_HOSTS) {
+    set_error("blocked host count out of range");
+    return 0;
+  }
+  pthread_mutex_lock(&g_lock);
+  g_blocked_count = 0;
+  for (i = 0; i < count; i++) {
+    if (!blocked_hosts[i]) {
+      continue;
+    }
+    snprintf(g_blocked_hosts[g_blocked_count], sizeof(g_blocked_hosts[0]), "%s",
+             blocked_hosts[i]);
+    g_blocked_count++;
+  }
+  g_upgrade_https = upgrade_https ? 1 : 0;
+  pthread_mutex_unlock(&g_lock);
   return 1;
 }
 
@@ -472,47 +1016,104 @@ void cinder_cef_pump(int ms) {
   }
 }
 
-int cinder_cef_state(void) { return g_state; }
+int cinder_cef_view_state(int view_id) {
+  cinder_view_t* v = view_by_id(view_id);
+  return v ? v->state : 0;
+}
 
-int cinder_cef_frame_size(int* width, int* height) {
-  if (!g_frame || g_width <= 0 || g_height <= 0) {
+int cinder_cef_view_frame_size(int view_id, int* width, int* height) {
+  cinder_view_t* v = view_by_id(view_id);
+  if (!v || !v->frame || v->width <= 0 || v->height <= 0) {
     return 0;
   }
   if (width) {
-    *width = g_width;
+    *width = v->width;
   }
   if (height) {
-    *height = g_height;
+    *height = v->height;
   }
   return 1;
 }
 
-int cinder_cef_copy_frame(unsigned char* dst, int capacity) {
-  if (!dst || !g_frame || capacity <= 0) {
+int cinder_cef_copy_view_frame(int view_id, unsigned char* dst, int capacity) {
+  cinder_view_t* v = view_by_id(view_id);
+  size_t needed;
+  if (!v || !dst || !v->frame || capacity <= 0) {
     return 0;
   }
-  size_t needed = (size_t)g_width * (size_t)g_height * 4u;
+  needed = (size_t)v->width * (size_t)v->height * 4u;
   if ((size_t)capacity < needed) {
     return 0;
   }
-  memcpy(dst, g_frame, needed);
+  memcpy(dst, v->frame, needed);
   return (int)needed;
 }
 
-const char* cinder_cef_title(void) { return g_title; }
-const char* cinder_cef_url(void) { return g_url; }
+const char* cinder_cef_view_title(int view_id) {
+  cinder_view_t* v = view_by_id(view_id);
+  return v ? v->title : "";
+}
+
+const char* cinder_cef_view_url(int view_id) {
+  cinder_view_t* v = view_by_id(view_id);
+  return v ? v->url : "";
+}
+
+int cinder_cef_state(void) {
+  cinder_view_t* v =
+      g_primary_view >= 0 ? &g_views[g_primary_view] : NULL;
+  return (v && v->used) ? v->state : 0;
+}
+
+int cinder_cef_frame_size(int* width, int* height) {
+  cinder_view_t* v =
+      g_primary_view >= 0 ? &g_views[g_primary_view] : NULL;
+  if (!v || !v->used) {
+    return 0;
+  }
+  return cinder_cef_view_frame_size(v->id, width, height);
+}
+
+int cinder_cef_copy_frame(unsigned char* dst, int capacity) {
+  cinder_view_t* v =
+      g_primary_view >= 0 ? &g_views[g_primary_view] : NULL;
+  if (!v || !v->used) {
+    return 0;
+  }
+  return cinder_cef_copy_view_frame(v->id, dst, capacity);
+}
+
+const char* cinder_cef_title(void) {
+  cinder_view_t* v =
+      g_primary_view >= 0 ? &g_views[g_primary_view] : NULL;
+  return (v && v->used) ? v->title : "";
+}
+
+const char* cinder_cef_url(void) {
+  cinder_view_t* v =
+      g_primary_view >= 0 ? &g_views[g_primary_view] : NULL;
+  return (v && v->used) ? v->url : "";
+}
+
 const char* cinder_cef_last_error(void) { return g_error; }
 
 const char* cinder_cef_version(void) { return CEF_VERSION; }
 
 void cinder_cef_shutdown(void) {
-  if (g_browser) {
-    g_browser->get_host(g_browser)->close_browser(g_browser->get_host(g_browser), 1);
-    g_browser = NULL;
+  int i;
+  for (i = 0; i < CINDER_CEF_MAX_VIEWS; i++) {
+    if (g_views[i].used && g_views[i].browser) {
+      cinder_cef_close_view(g_views[i].id, 1);
+    }
   }
   cef_shutdown();
-  free(g_frame);
-  g_frame = NULL;
-  g_frame_cap = 0;
-  g_state = 0;
+  for (i = 0; i < CINDER_CEF_MAX_VIEWS; i++) {
+    view_release_frame(&g_views[i]);
+    memset(&g_views[i], 0, sizeof(g_views[i]));
+  }
+  g_primary_view = -1;
+  g_blocked_count = 0;
+  g_upgrade_https = 0;
+  g_event_cb = NULL;
+  g_event_user = NULL;
 }

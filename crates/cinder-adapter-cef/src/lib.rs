@@ -49,6 +49,23 @@ pub const STATE_LOADED: i32 = 2;
 pub const STATE_PAINTED: i32 = 4;
 pub const STATE_CLOSED: i32 = 8;
 
+/// Event kinds the shim reports through its callback. Kept in sync with the
+/// `CINDER_CEF_EV_*` defines in `shim/cinder_cef_shim.h`.
+pub const EV_CREATED: i32 = 1;
+pub const EV_LOAD_START: i32 = 2;
+pub const EV_LOAD_END: i32 = 3;
+pub const EV_LOAD_ERROR: i32 = 4;
+pub const EV_TITLE: i32 = 5;
+pub const EV_URL: i32 = 6;
+pub const EV_CLOSED: i32 = 7;
+pub const EV_CLOSE_REQUESTED: i32 = 8;
+pub const EV_PAINTED: i32 = 9;
+pub const EV_BLOCKED: i32 = 10;
+
+mod engine;
+
+pub use engine::{measured_capabilities, CefEngine, CefEngineConfig};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CefError {
     /// `cef_initialize` returned false.

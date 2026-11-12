@@ -19,5 +19,9 @@ all = { level = "warn", priority = -1 }
 [dependencies]
 cinder-adapter = { path = "../cinder-adapter" }
 
+[[test]]
+name = "engine_e2e"
+harness = false
+
 [build-dependencies]
 cc = "1"

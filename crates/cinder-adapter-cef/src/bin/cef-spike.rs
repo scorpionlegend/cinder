@@ -29,7 +29,9 @@ fn main() {
         .ok()
         .and_then(|p| p.parent().map(PathBuf::from))
         .unwrap_or_else(|| PathBuf::from("."));
-    let resources = if exe_dir.join("icudtl.dat").exists() {
+    let resources = if exe_dir.join("icudtl.dat").exists()
+        && exe_dir.join("v8_context_snapshot.bin").exists()
+    {
         exe_dir.clone()
     } else {
         root.join("Resources")

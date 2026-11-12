@@ -1,0 +1,799 @@
+//! `Engine` implementation over the CEF shim.
+//!
+//! CEF requires every call — initialize, browser creation, the message loop,
+//! shutdown — on one thread. `Engine::execute` is called from the orchestrator's
+//! thread, so this module owns a dedicated engine thread: commands arrive over a
+//! channel, the thread pumps CEF, and events leave through the shim's callback
+//! into the same `EventStream` the mock engine uses.
+//!
+//! Nothing here blocks on CEF from the caller's side: `execute` waits for the
+//! engine thread to accept the command, not for the command's effects.
+
+use std::collections::HashMap;
+use std::ffi::{c_char, c_int, c_void, CStr, CString};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+use cinder_adapter::capability::Capabilities;
+use cinder_adapter::command::{Command, CommandOutcome, Surface};
+use cinder_adapter::engine::Engine;
+use cinder_adapter::error::AdapterError;
+use cinder_adapter::event::{EngineMessage, Event, EventEnvelope, EventStream, LoadFailure};
+use cinder_adapter::ids::{IdAllocator, ProfileId, SeqNo, ViewId};
+use cinder_adapter::policy::PolicySnapshot;
+use cinder_adapter::sanitize::Url;
+use cinder_adapter::view_state::ViewState;
+
+use crate::{Cef, CefError, STATE_CLOSED, STATE_CREATED};
+
+mod ffi {
+    use super::*;
+
+    extern "C" {
+        pub fn cinder_cef_set_event_callback(
+            cb: Option<extern "C" fn(*mut c_void, c_int, c_int, *const c_char, *const c_char)>,
+            user_data: *mut c_void,
+        );
+        pub fn cinder_cef_create_view(
+            view_id: c_int,
+            url: *const c_char,
+            width: c_int,
+            height: c_int,
+        ) -> c_int;
+        pub fn cinder_cef_close_view(view_id: c_int, force: c_int) -> c_int;
+        pub fn cinder_cef_navigate(view_id: c_int, url: *const c_char) -> c_int;
+        pub fn cinder_cef_reload(view_id: c_int) -> c_int;
+        pub fn cinder_cef_stop(view_id: c_int) -> c_int;
+        pub fn cinder_cef_go_back(view_id: c_int) -> c_int;
+        pub fn cinder_cef_go_forward(view_id: c_int) -> c_int;
+        pub fn cinder_cef_set_zoom(view_id: c_int, level: f64) -> c_int;
+        pub fn cinder_cef_set_mute(view_id: c_int, muted: c_int) -> c_int;
+        pub fn cinder_cef_find(view_id: c_int, query: *const c_char, forward: c_int) -> c_int;
+        pub fn cinder_cef_resize(view_id: c_int, width: c_int, height: c_int) -> c_int;
+        pub fn cinder_cef_set_visible(view_id: c_int, visible: c_int) -> c_int;
+        pub fn cinder_cef_set_focus(view_id: c_int, focused: c_int) -> c_int;
+        pub fn cinder_cef_view_state(view_id: c_int) -> c_int;
+        pub fn cinder_cef_set_policy(
+            blocked_hosts: *const *const c_char,
+            count: c_int,
+            upgrade_https: c_int,
+        ) -> c_int;
+    }
+}
+
+/// How long one `pump` slice runs before commands are serviced again.
+const PUMP_MS: u32 = 5;
+/// How long `execute` waits for the engine thread to accept a command.
+const ACCEPT_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long view creation waits for CEF's `on_after_created`.
+const CREATE_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long shutdown waits for views to confirm closure.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Where CEF finds its resources and where it may write its cache.
+#[derive(Debug, Clone)]
+pub struct CefEngineConfig {
+    pub resources_dir: PathBuf,
+    pub locales_dir: PathBuf,
+    pub cache_dir: PathBuf,
+    /// Extra Chromium switches, appended to the command line.
+    pub extra_args: Vec<String>,
+    /// What this build actually provides. Defaults to [`measured_capabilities`].
+    pub capabilities: Capabilities,
+}
+
+impl CefEngineConfig {
+    /// Resources and locales next to the running executable, cache under the
+    /// system temp directory. This is the layout `cinder-dist` produces.
+    pub fn beside_executable() -> Self {
+        let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("."));
+        let dir = exe.parent().map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+        let cache = std::env::temp_dir().join("cinder-cache");
+        Self {
+            resources_dir: dir.clone(),
+            locales_dir: dir.join("locales"),
+            cache_dir: cache,
+            extra_args: Vec::new(),
+            capabilities: measured_capabilities(),
+        }
+    }
+}
+
+/// The capability set this adapter actually implements.
+///
+/// Every `true` here is backed by a shim entry point that the engine calls. It
+/// is deliberately narrower than [`Capabilities::cef_baseline_expected`]: that
+/// constant records what CEF is *expected* to offer, not what Cinder wires up.
+pub const fn measured_capabilities() -> Capabilities {
+    Capabilities {
+        incognito_contexts: false,
+        offscreen_rendering: true,
+        download_pause: false,
+        print_to_pdf: false,
+        find_in_page: true,
+        devtools: false,
+        request_interception: true,
+    }
+}
+
+struct EngineRequest {
+    command: Command,
+    ack: Sender<Result<CommandOutcome, AdapterError>>,
+}
+
+/// Shared with the C callback. Lives on the engine thread's stack frame and is
+/// handed to C as a raw pointer for the lifetime of the CEF session.
+struct EventSink {
+    tx: Sender<EngineMessage>,
+    seq: Mutex<HashMap<ViewId, SeqNo>>,
+    /// Shim view id → adapter view id.
+    views: Mutex<HashMap<i32, ViewId>>,
+}
+
+impl EventSink {
+    fn new(tx: Sender<EngineMessage>) -> Self {
+        Self {
+            tx,
+            seq: Mutex::new(HashMap::new()),
+            views: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn bind(&self, raw: i32, view: ViewId) {
+        self.views.lock().unwrap_or_else(|e| e.into_inner()).insert(raw, view);
+    }
+
+    fn unbind(&self, raw: i32) {
+        self.views.lock().unwrap_or_else(|e| e.into_inner()).remove(&raw);
+    }
+
+    fn view_of(&self, raw: i32) -> Option<ViewId> {
+        self.views
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&raw)
+            .copied()
+    }
+
+    fn emit(&self, view: Option<ViewId>, event: Event) {
+        let seq = match view {
+            Some(v) => {
+                let mut map = self.seq.lock().unwrap_or_else(|e| e.into_inner());
+                let entry = map.entry(v).or_default();
+                let current = *entry;
+                *entry = current.next();
+                current
+            }
+            None => SeqNo::default(),
+        };
+        let _ = self
+            .tx
+            .send(EngineMessage::Event(EventEnvelope::new(seq, event)));
+    }
+}
+
+fn c_string(value: &str, what: &'static str) -> Result<CString, AdapterError> {
+    CString::new(value).map_err(|_| AdapterError::InvalidArgument(what))
+}
+
+fn load_failure(code: i32) -> LoadFailure {
+    match code {
+        -3 => LoadFailure::Aborted,          // ERR_ABORTED
+        -7 => LoadFailure::TimedOut,         // ERR_TIMED_OUT
+        -105 | -106 => LoadFailure::ConnectionFailed, // NAME_NOT_RESOLVED, CONNECTION_FAILED
+        -299..=-200 => LoadFailure::CertificateError,
+        _ => LoadFailure::Unknown,
+    }
+}
+
+/// CEF callback entry point. Runs on the engine thread inside `pump`.
+extern "C" fn on_cef_event(
+    user_data: *mut c_void,
+    view_id: c_int,
+    kind: c_int,
+    a: *const c_char,
+    b: *const c_char,
+) {
+    if user_data.is_null() {
+        return;
+    }
+    // A panic must never unwind into C.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // SAFETY: `user_data` is the `Arc<EventSink>` pointer registered in
+        // `run_engine`, which outlives every CEF callback.
+        let sink = unsafe { &*(user_data as *const EventSink) };
+        let Some(view) = sink.view_of(view_id) else {
+            return;
+        };
+        let text = |p: *const c_char| -> String {
+            if p.is_null() {
+                String::new()
+            } else {
+                // SAFETY: the shim passes NUL-terminated buffers valid for the
+                // duration of this call.
+                unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned()
+            }
+        };
+
+        match kind {
+            crate::EV_CREATED => {
+                sink.emit(Some(view), Event::ViewCreated { view });
+                sink.emit(Some(view), Event::ViewReady { view });
+            }
+            crate::EV_LOAD_START => {
+                if let Ok(url) = Url::parse(&text(a)) {
+                    sink.emit(Some(view), Event::NavigationStarted { view, url });
+                }
+                sink.emit(Some(view), Event::LoadProgress { view, fraction: 0.0 });
+            }
+            crate::EV_LOAD_END => {
+                sink.emit(Some(view), Event::LoadProgress { view, fraction: 1.0 });
+                sink.emit(Some(view), Event::LoadFinished { view });
+            }
+            crate::EV_LOAD_ERROR => {
+                let code = text(a).parse::<i32>().unwrap_or(0);
+                let failed = text(b);
+                if let Ok(url) = Url::parse(&failed) {
+                    sink.emit(Some(view), Event::UrlChanged { view, url });
+                }
+                sink.emit(
+                    Some(view),
+                    Event::LoadFailed {
+                        view,
+                        reason: load_failure(code),
+                    },
+                );
+            }
+            crate::EV_TITLE => {
+                sink.emit(Some(view), Event::TitleChanged { view, title: text(a) });
+            }
+            crate::EV_URL => {
+                if let Ok(url) = Url::parse(&text(a)) {
+                    sink.emit(Some(view), Event::UrlChanged { view, url });
+                }
+            }
+            crate::EV_BLOCKED => {
+                if let Ok(url) = Url::parse(&text(a)) {
+                    sink.emit(Some(view), Event::UrlChanged { view, url });
+                }
+                sink.emit(
+                    Some(view),
+                    Event::LoadFailed {
+                        view,
+                        reason: LoadFailure::BlockedByPolicy,
+                    },
+                );
+            }
+            crate::EV_CLOSE_REQUESTED => {
+                sink.emit(Some(view), Event::CloseRequested { view });
+            }
+            crate::EV_CLOSED => {
+                sink.emit(Some(view), Event::ViewClosed { view });
+            }
+            _ => {}
+        }
+    }));
+}
+
+#[derive(Debug, Default)]
+struct EngineState {
+    profiles: HashMap<ProfileId, bool>,
+    views: HashMap<ViewId, ViewState>,
+    policy: Option<Arc<PolicySnapshot>>,
+    closed: bool,
+}
+
+impl EngineState {
+    fn gate(&self, view: ViewId) -> Result<(), AdapterError> {
+        match self.views.get(&view) {
+            Some(ViewState::Live) => Ok(()),
+            Some(ViewState::Creating) => Err(AdapterError::NotInitialized),
+            Some(ViewState::Closing) => Err(AdapterError::ViewClosing),
+            Some(ViewState::Closed) => Err(AdapterError::ViewClosed),
+            Some(ViewState::Failed) => Err(AdapterError::EngineFault("view failed".into())),
+            None => Err(AdapterError::ViewClosed),
+        }
+    }
+}
+
+/// A CEF-backed engine. One per process: CEF permits a single initialization.
+pub struct CefEngine {
+    tx: Mutex<Sender<EngineRequest>>,
+    rx: Mutex<Option<Receiver<EngineMessage>>>,
+    capabilities: Capabilities,
+    closed: AtomicBool,
+    join: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl std::fmt::Debug for CefEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CefEngine")
+            .field("capabilities", &self.capabilities)
+            .field("closed", &self.closed.load(Ordering::SeqCst))
+            .finish()
+    }
+}
+
+impl CefEngine {
+    /// Start CEF on a dedicated thread. Blocks until initialization succeeds or
+    /// fails, so a broken runtime is reported here rather than on first use.
+    pub fn new(config: CefEngineConfig) -> Result<Self, CefError> {
+        let (event_tx, event_rx) = channel();
+        let (cmd_tx, cmd_rx) = channel();
+        let (init_tx, init_rx) = channel();
+
+        let capabilities = config.capabilities;
+        let join = std::thread::Builder::new()
+            .name("cinder-cef".into())
+            .spawn(move || run_engine(config, cmd_rx, event_tx, init_tx))
+            .map_err(|e| CefError::InitFailed(format!("engine thread: {e}")))?;
+
+        match init_rx.recv_timeout(Duration::from_secs(60)) {
+            Ok(Ok(())) => Ok(Self {
+                tx: Mutex::new(cmd_tx),
+                rx: Mutex::new(Some(event_rx)),
+                capabilities,
+                closed: AtomicBool::new(false),
+                join: Mutex::new(Some(join)),
+            }),
+            Ok(Err(message)) => {
+                let _ = join.join();
+                Err(CefError::InitFailed(message))
+            }
+            Err(_) => Err(CefError::InitFailed("engine thread did not report".into())),
+        }
+    }
+
+    fn send(&self, command: Command) -> Result<CommandOutcome, AdapterError> {
+        let (ack_tx, ack_rx) = channel();
+        self.tx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .send(EngineRequest {
+                command,
+                ack: ack_tx,
+            })
+            .map_err(|_| AdapterError::EngineFault("engine thread is gone".into()))?;
+        match ack_rx.recv_timeout(ACCEPT_TIMEOUT) {
+            Ok(result) => result,
+            Err(_) => Err(AdapterError::EngineFault(
+                "engine thread did not accept the command".into(),
+            )),
+        }
+    }
+}
+
+impl Engine for CefEngine {
+    fn capabilities(&self) -> Capabilities {
+        self.capabilities
+    }
+
+    fn execute(&self, command: Command) -> Result<CommandOutcome, AdapterError> {
+        command.validate()?;
+        if !self.capabilities.supports(&command) {
+            return Err(AdapterError::Unsupported(command.name()));
+        }
+        if matches!(command, Command::Shutdown) {
+            return self.shutdown().map(|_| CommandOutcome::Done);
+        }
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(AdapterError::ShuttingDown);
+        }
+        self.send(command)
+    }
+
+    fn subscribe(&self) -> Option<EventStream> {
+        self.rx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .map(EventStream::new)
+    }
+
+    fn shutdown(&self) -> Result<(), AdapterError> {
+        if self.closed.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
+        let result = self.send(Command::Shutdown);
+        if let Some(handle) = self
+            .join
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            let _ = handle.join();
+        }
+        result.map(|_| ())
+    }
+}
+
+impl Drop for CefEngine {
+    fn drop(&mut self) {
+        if !self.closed.load(Ordering::SeqCst) {
+            let _ = self.shutdown();
+        }
+    }
+}
+
+fn run_engine(
+    config: CefEngineConfig,
+    cmd_rx: Receiver<EngineRequest>,
+    event_tx: Sender<EngineMessage>,
+    init_tx: Sender<Result<(), String>>,
+) {
+    let cef = if config.extra_args.is_empty() {
+        Cef::init(&config.resources_dir, &config.locales_dir, &config.cache_dir)
+    } else {
+        Cef::init_with_args(
+            &config.resources_dir,
+            &config.locales_dir,
+            &config.cache_dir,
+            &config.extra_args,
+        )
+    };
+    let cef = match cef {
+        Ok(cef) => cef,
+        Err(e) => {
+            let _ = init_tx.send(Err(e.to_string()));
+            return;
+        }
+    };
+
+    let sink = Arc::new(EventSink::new(event_tx));
+    let sink_ptr = Arc::into_raw(Arc::clone(&sink)) as *mut c_void;
+    // SAFETY: the pointer stays valid until the matching `from_raw` below,
+    // which happens after CEF has shut down and stopped calling back.
+    unsafe { ffi::cinder_cef_set_event_callback(Some(on_cef_event), sink_ptr) };
+
+    sink.emit(
+        None,
+        Event::EngineInitialized {
+            engine_version: Cef::version(),
+        },
+    );
+    let _ = init_tx.send(Ok(()));
+
+    let ids = IdAllocator::new();
+    let mut state = EngineState::default();
+
+    loop {
+        cef.pump(PUMP_MS);
+        reconcile(&mut state, &sink);
+
+        while let Ok(request) = cmd_rx.try_recv() {
+            if matches!(request.command, Command::Shutdown) {
+                let result = shutdown_views(&cef, &mut state, &sink);
+                let _ = request.ack.send(result);
+                finish(&cef, &sink, sink_ptr);
+                return;
+            }
+            let result = handle(&cef, &mut state, &sink, &ids, request.command);
+            let _ = request.ack.send(result);
+        }
+    }
+}
+
+fn finish(cef: &Cef, sink: &EventSink, sink_ptr: *mut c_void) {
+    sink.emit(None, Event::ShutdownComplete);
+    // SAFETY: unregister before releasing the sink so no callback can observe a
+    // dangling pointer.
+    unsafe {
+        ffi::cinder_cef_set_event_callback(None, std::ptr::null_mut());
+        drop(Arc::from_raw(sink_ptr as *const EventSink));
+    }
+    let _ = sink;
+    let _ = cef;
+}
+
+fn reconcile(state: &mut EngineState, sink: &EventSink) {
+    for (view, view_state) in state.views.iter_mut() {
+        if view_state.is_terminal() {
+            continue;
+        }
+        // SAFETY: reads an int from the shim on the engine thread.
+        let raw = unsafe { ffi::cinder_cef_view_state(view.get() as c_int) };
+        if raw & STATE_CLOSED != 0 {
+            *view_state = ViewState::Closed;
+            sink.unbind(view.get() as i32);
+        }
+    }
+}
+
+fn shutdown_views(
+    cef: &Cef,
+    state: &mut EngineState,
+    sink: &EventSink,
+) -> Result<CommandOutcome, AdapterError> {
+    let open: Vec<ViewId> = state
+        .views
+        .iter()
+        .filter(|(_, s)| !s.is_terminal())
+        .map(|(v, _)| *v)
+        .collect();
+
+    for view in &open {
+        sink.emit(Some(*view), Event::ViewClosing { view: *view });
+        state.views.insert(*view, ViewState::Closing);
+        // SAFETY: engine thread, valid view id.
+        unsafe { ffi::cinder_cef_close_view(view.get() as c_int, 1) };
+    }
+
+    let deadline = Instant::now() + CLOSE_TIMEOUT;
+    while Instant::now() < deadline {
+        cef.pump(PUMP_MS);
+        reconcile(state, sink);
+        if state.views.values().all(|s| s.is_terminal()) {
+            break;
+        }
+    }
+
+    state.closed = true;
+    Ok(CommandOutcome::Done)
+}
+
+fn wait_for_created(cef: &Cef, raw: i32) -> bool {
+    let deadline = Instant::now() + CREATE_TIMEOUT;
+    loop {
+        // SAFETY: engine thread, plain int read.
+        let state = unsafe { ffi::cinder_cef_view_state(raw) };
+        if state & STATE_CREATED != 0 {
+            return true;
+        }
+        if state & STATE_CLOSED != 0 || Instant::now() >= deadline {
+            return false;
+        }
+        cef.pump(PUMP_MS);
+    }
+}
+
+fn handle(
+    cef: &Cef,
+    state: &mut EngineState,
+    sink: &EventSink,
+    ids: &IdAllocator,
+    command: Command,
+) -> Result<CommandOutcome, AdapterError> {
+    match command {
+        Command::Shutdown => Ok(CommandOutcome::Done),
+
+        Command::CreateProfile { path, incognito } => {
+            if path.is_empty() {
+                return Err(AdapterError::InvalidArgument("empty profile path"));
+            }
+            let id = ids.next_profile();
+            state.profiles.insert(id, incognito);
+            Ok(CommandOutcome::ProfileCreated(id))
+        }
+
+        Command::CloseProfile { profile } => {
+            if state.profiles.remove(&profile).is_none() {
+                return Err(AdapterError::ProfileClosed);
+            }
+            Ok(CommandOutcome::Done)
+        }
+
+        Command::ClearData { profile, .. } => {
+            if !state.profiles.contains_key(&profile) {
+                return Err(AdapterError::ProfileClosed);
+            }
+            // Chromium owns the storage; deleting it needs the cookie manager's
+            // async completion path, which is not wired up yet.
+            Err(AdapterError::Unsupported("clear_data"))
+        }
+
+        Command::CreateView {
+            profile,
+            surface,
+            initial_url,
+        } => {
+            if !state.profiles.contains_key(&profile) {
+                return Err(AdapterError::ProfileClosed);
+            }
+            if matches!(surface, Surface::NativeChild { .. }) {
+                // Windowless rendering only: there is no window to embed into.
+                return Err(AdapterError::Unsupported("native_child_surface"));
+            }
+            let (width, height) = surface.size();
+            let url = initial_url
+                .as_ref()
+                .map(|u| u.as_str().to_string())
+                .unwrap_or_else(|| "about:blank".to_string());
+            let url = c_string(&url, "url")?;
+
+            let view = ids.next_view();
+            let raw = view.get() as c_int;
+            // SAFETY: engine thread; url is NUL-terminated; dimensions validated.
+            let ok = unsafe {
+                ffi::cinder_cef_create_view(raw, url.as_ptr(), width as c_int, height as c_int)
+            };
+            if ok != 1 {
+                return Err(AdapterError::EngineFault(Cef::last_error()));
+            }
+
+            state.views.insert(view, ViewState::Creating);
+            sink.bind(raw, view);
+            if !wait_for_created(cef, raw) {
+                state.views.insert(view, ViewState::Failed);
+                sink.unbind(raw);
+                return Err(AdapterError::EngineFault(
+                    "CEF did not report browser creation".into(),
+                ));
+            }
+            state.views.insert(view, ViewState::Live);
+            Ok(CommandOutcome::ViewCreated(view))
+        }
+
+        Command::CloseView { view, force } => {
+            let current = state.views.get(&view).copied().ok_or(AdapterError::ViewClosed)?;
+            if current.is_terminal() {
+                return Err(AdapterError::ViewClosed);
+            }
+            sink.emit(Some(view), Event::ViewClosing { view });
+            state.views.insert(view, ViewState::Closing);
+            // SAFETY: engine thread, valid view id.
+            let ok = unsafe { ffi::cinder_cef_close_view(view.get() as c_int, force as c_int) };
+            if ok != 1 && force {
+                state.views.insert(view, ViewState::Closed);
+                sink.emit(Some(view), Event::ViewClosed { view });
+                sink.unbind(view.get() as c_int);
+            }
+            Ok(CommandOutcome::Done)
+        }
+
+        Command::Navigate { view, url } => {
+            state.gate(view)?;
+            let url = c_string(url.as_str(), "url")?;
+            // SAFETY: engine thread, live view, NUL-terminated url.
+            let ok = unsafe { ffi::cinder_cef_navigate(view.get() as c_int, url.as_ptr()) };
+            if ok != 1 {
+                return Err(AdapterError::EngineFault(Cef::last_error()));
+            }
+            Ok(CommandOutcome::Done)
+        }
+
+        Command::Reload { view, .. } => {
+            state.gate(view)?;
+            // SAFETY: engine thread, live view.
+            let ok = unsafe { ffi::cinder_cef_reload(view.get() as c_int) };
+            if ok != 1 {
+                return Err(AdapterError::EngineFault(Cef::last_error()));
+            }
+            Ok(CommandOutcome::Done)
+        }
+
+        Command::Stop { view } => {
+            state.gate(view)?;
+            // SAFETY: engine thread, live view.
+            let ok = unsafe { ffi::cinder_cef_stop(view.get() as c_int) };
+            if ok != 1 {
+                return Err(AdapterError::EngineFault(Cef::last_error()));
+            }
+            Ok(CommandOutcome::Done)
+        }
+
+        Command::GoBack { view } => {
+            state.gate(view)?;
+            // SAFETY: engine thread, live view.
+            let ok = unsafe { ffi::cinder_cef_go_back(view.get() as c_int) };
+            if ok != 1 {
+                return Err(AdapterError::EngineFault(Cef::last_error()));
+            }
+            Ok(CommandOutcome::Done)
+        }
+
+        Command::GoForward { view } => {
+            state.gate(view)?;
+            // SAFETY: engine thread, live view.
+            let ok = unsafe { ffi::cinder_cef_go_forward(view.get() as c_int) };
+            if ok != 1 {
+                return Err(AdapterError::EngineFault(Cef::last_error()));
+            }
+            Ok(CommandOutcome::Done)
+        }
+
+        Command::SetZoom { view, factor } => {
+            state.gate(view)?;
+            // CEF zoom levels are logarithmic in 1.2, the Chromium convention.
+            let level = (factor as f64).ln() / 1.2f64.ln();
+            // SAFETY: engine thread, live view, finite level.
+            let ok = unsafe { ffi::cinder_cef_set_zoom(view.get() as c_int, level) };
+            if ok != 1 {
+                return Err(AdapterError::EngineFault(Cef::last_error()));
+            }
+            Ok(CommandOutcome::Done)
+        }
+
+        Command::MuteAudio { view, muted } => {
+            state.gate(view)?;
+            // SAFETY: engine thread, live view.
+            let ok = unsafe { ffi::cinder_cef_set_mute(view.get() as c_int, muted as c_int) };
+            if ok != 1 {
+                return Err(AdapterError::EngineFault(Cef::last_error()));
+            }
+            Ok(CommandOutcome::Done)
+        }
+
+        Command::FindInPage {
+            view,
+            query,
+            forward,
+        } => {
+            state.gate(view)?;
+            let query = c_string(&query, "find query")?;
+            // SAFETY: engine thread, live view, NUL-terminated query.
+            let ok = unsafe {
+                ffi::cinder_cef_find(view.get() as c_int, query.as_ptr(), forward as c_int)
+            };
+            if ok != 1 {
+                return Err(AdapterError::EngineFault(Cef::last_error()));
+            }
+            Ok(CommandOutcome::Done)
+        }
+
+        Command::Resize {
+            view,
+            width,
+            height,
+            scale: _,
+        } => {
+            state.gate(view)?;
+            // SAFETY: engine thread, live view, validated dimensions.
+            let ok = unsafe {
+                ffi::cinder_cef_resize(view.get() as c_int, width as c_int, height as c_int)
+            };
+            if ok != 1 {
+                return Err(AdapterError::EngineFault(Cef::last_error()));
+            }
+            Ok(CommandOutcome::Done)
+        }
+
+        Command::SetVisible { view, visible } => {
+            state.gate(view)?;
+            // SAFETY: engine thread, live view.
+            let ok =
+                unsafe { ffi::cinder_cef_set_visible(view.get() as c_int, visible as c_int) };
+            if ok != 1 {
+                return Err(AdapterError::EngineFault(Cef::last_error()));
+            }
+            Ok(CommandOutcome::Done)
+        }
+
+        Command::SetFocus { view, focused } => {
+            state.gate(view)?;
+            // SAFETY: engine thread, live view.
+            let ok =
+                unsafe { ffi::cinder_cef_set_focus(view.get() as c_int, focused as c_int) };
+            if ok != 1 {
+                return Err(AdapterError::EngineFault(Cef::last_error()));
+            }
+            Ok(CommandOutcome::Done)
+        }
+
+        Command::InstallPolicy { snapshot } => {
+            let hosts: Vec<CString> = snapshot
+                .blocked_hosts()
+                .iter()
+                .map(|h| c_string(h, "blocked host"))
+                .collect::<Result<_, _>>()?;
+            let ptrs: Vec<*const c_char> = hosts.iter().map(|h| h.as_ptr()).collect();
+            // SAFETY: engine thread; the pointer array and every string outlive
+            // the call, and the shim copies them.
+            let ok = unsafe {
+                ffi::cinder_cef_set_policy(
+                    ptrs.as_ptr(),
+                    ptrs.len() as c_int,
+                    snapshot.https_upgrade() as c_int,
+                )
+            };
+            if ok != 1 {
+                return Err(AdapterError::EngineFault(Cef::last_error()));
+            }
+            state.policy = Some(snapshot);
+            Ok(CommandOutcome::Done)
+        }
+    }
+}
