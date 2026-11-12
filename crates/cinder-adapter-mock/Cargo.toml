@@ -1,0 +1,13 @@
+[package]
+name = "cinder-adapter-mock"
+description = "Scripted in-memory engine implementing the Cinder adapter traits"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+cinder-adapter = { path = "../cinder-adapter" }
