@@ -17,8 +17,13 @@ fn main() {
         return;
     }
 
+    let macos = std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos");
+
     // `$ORIGIN` first so a packaged bundle finds the library beside itself.
-    println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN");
+    // macOS has no `$ORIGIN`; its bundle layout is handled below.
+    if !macos {
+        println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN");
+    }
 
     let root = std::env::var("CINDER_CEF_ROOT").unwrap_or_else(|_| {
         format!("{}/cef", std::env::var("HOME").unwrap_or_default())
@@ -26,5 +31,11 @@ fn main() {
     let release = PathBuf::from(root).join("Release");
     if release.is_dir() {
         println!("cargo:rustc-link-arg=-Wl,-rpath,{}", release.display());
+    }
+
+    // On macOS the runtime lives in `Cinder.app/Contents/Frameworks`, which is
+    // `../Frameworks` relative to the executable.
+    if macos {
+        println!("cargo:rustc-link-arg=-Wl,-rpath,@executable_path/../Frameworks");
     }
 }

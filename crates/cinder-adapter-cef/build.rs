@@ -55,12 +55,15 @@ fn main() {
             copy_runtime_dlls(&release_dir);
         }
         "macos" => {
-            println!("cargo:rustc-link-search=native={}", release_dir.display());
-            println!("cargo:rustc-link-arg=-F{}", release_dir.display());
-            println!("cargo:rustc-link-arg=-framework");
-            println!("cargo:rustc-link-arg=Chromium Embedded Framework");
-            println!("cargo:rustc-link-arg=-Wl,-rpath,@executable_path/../Frameworks");
-            println!("cargo:rustc-link-arg=-Wl,-rpath,{}", release_dir.display());
+            // CEF ships as a framework on macOS. `rustc-link-lib` and
+            // `rustc-link-search` are recorded in the crate metadata and
+            // propagate to the final binary link; `rustc-link-arg` does not,
+            // which left every CEF symbol undefined when linking `cinder`.
+            println!(
+                "cargo:rustc-link-search=framework={}",
+                release_dir.display()
+            );
+            println!("cargo:rustc-link-lib=framework=Chromium Embedded Framework");
         }
         _ => {
             println!("cargo:rustc-link-search=native={}", release_dir.display());

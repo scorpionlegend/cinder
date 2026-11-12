@@ -15,6 +15,10 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # Keep the C shim and the Rust objects on the same minimum macOS version;
+  # without it clang stamps the shim with the SDK version and ld warns that the
+  # object was built for a newer macOS than the binary.
+  MACOSX_DEPLOYMENT_TARGET: "10.13"
 
 jobs:
   build:
