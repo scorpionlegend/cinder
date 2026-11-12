@@ -1,0 +1,19 @@
+[package]
+name = "cinder-cli"
+description = "Cinder command-line shell: drives the orchestrator against the mock engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "cinder"
+path = "src/main.rs"
+
+[dependencies]
+cinder-adapter = { path = "../cinder-adapter" }
+cinder-adapter-mock = { path = "../cinder-adapter-mock" }
+cinder-core = { path = "../cinder-core" }
