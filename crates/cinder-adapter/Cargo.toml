@@ -1,0 +1,12 @@
+[package]
+name = "cinder-adapter"
+description = "Cinder engine adapter: the typed, engine-neutral L2 API (no native code)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]

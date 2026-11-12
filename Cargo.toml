@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/cinder-adapter",
+    "crates/cinder-adapter-mock",
+    "crates/cinder-core",
+    "crates/cinder-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "Apache-2.0"
+repository = "https://example.invalid/cinder"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }

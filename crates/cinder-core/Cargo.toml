@@ -1,0 +1,16 @@
+[package]
+name = "cinder-core"
+description = "Cinder orchestrator: windows, tabs, session model, policy-driven decisions"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+cinder-adapter = { path = "../cinder-adapter" }
+
+[dev-dependencies]
+cinder-adapter-mock = { path = "../cinder-adapter-mock" }
