@@ -84,6 +84,14 @@ jobs:
           --version ${{ env.CINDER_VERSION }}
           --formats ${{ matrix.formats }}
 
+      - name: Check deb dependencies resolve
+        if: contains(matrix.formats, 'deb')
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          apt-get install -s ./dist/*.deb
+
       - name: Smoke test the bundle
         shell: bash
         run: |

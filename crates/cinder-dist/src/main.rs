@@ -23,19 +23,21 @@ pub const DESKTOP_FILE: &str = include_str!("../../../packaging/linux/cinder.des
 pub const APPSTREAM_FILE: &str =
     include_str!("../../../packaging/linux/io.cinder.Cinder.metainfo.xml");
 
-/// Direct dependencies of the bundled Chromium runtime, derived from the
-/// SONAMEs `libcef.so` links against. Package names follow Debian; the list has
-/// not been validated against a clean container yet.
-const DEB_DEPENDS: &str = "libc6, libx11-6, libxcomposite1, libxdamage1, libxext6, \
-libxfixes3, libxrandr2, libxrender1, libxres1, libxi6, libxcb1, libxkbcommon0, \
-libgbm1, libdrm2, libnss3, libnspr4, libcups2, libatk1.0-0, libatk-bridge2.0-0, \
-libatspi2.0-0, libpango-1.0-0, libcairo2, libasound2, libdbus-1-3, libexpat1, \
-libfontconfig1, libfreetype6, libglib2.0-0, libudev1, libsystemd0, libselinux1, \
-zlib1g, libpng16-16, libbz2-1.0, libgcc-s1, libgnutls30, libp11-kit0, libtasn1-6, \
-libavahi-client3, libkrb5-3, libgssapi-krb5-2, libcom-err2, libk5crypto3, \
-libkeyutils1, libkrb5support0, libidn2-0, libunistring2, libnettle8, libhogweed6, \
-libgmp10, libffi8, libpcre2-8-0, libgraphite2-3, libharfbuzz0b, libthai0, \
-libdatrie1, libfribidi0, libpixman-1-0, libbrotli1, libmount1, libblkid1";
+/// Direct dependencies of the bundled Chromium runtime: exactly the SONAMEs
+/// `libcef.so` lists in its `DT_NEEDED` entries, mapped to Debian package
+/// names. Transitive libraries are deliberately not listed; apt resolves them.
+///
+/// Packages renamed for the 64-bit `time_t` transition (`libasound2t64` and
+/// friends, Ubuntu 24.04+) are declared as alternatives so one control file
+/// installs on both older and newer releases. `libunistring2` is not listed at
+/// all: it no longer exists in Ubuntu 26.04 and was only ever a transitive
+/// dependency of libgnutls30.
+const DEB_DEPENDS: &str = "libc6, libgcc-s1, libx11-6, libxcb1, libxcomposite1, \
+libxdamage1, libxext6, libxfixes3, libxrandr2, libxkbcommon0, libgbm1, libnss3, \
+libnspr4, libdbus-1-3, libexpat1, libpango-1.0-0, libcairo2, libudev1, \
+libcups2 | libcups2t64, libatk1.0-0 | libatk1.0-0t64, \
+libatk-bridge2.0-0 | libatk-bridge2.0-0t64, libatspi2.0-0 | libatspi2.0-0t64, \
+libasound2 | libasound2t64, libglib2.0-0 | libglib2.0-0t64";
 
 struct Args {
     target: String,
