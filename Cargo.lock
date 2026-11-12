@@ -7,6 +7,13 @@ name = "cinder-adapter"
 version = "0.1.0"
 
 [[package]]
+name = "cinder-adapter-cef"
+version = "0.1.0"
+dependencies = [
+ "cinder-adapter",
+]
+
+[[package]]
 name = "cinder-adapter-mock"
 version = "0.1.0"
 dependencies = [
