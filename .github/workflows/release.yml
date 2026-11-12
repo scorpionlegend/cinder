@@ -36,10 +36,14 @@ jobs:
             target: x86_64-apple-darwin
             cef: macosx64
             formats: tar.gz
-          - os: macos-14
+          # The arm64 macOS runner configuration is not available to this
+          # account, so the arm64 bundle is cross-compiled on the Intel runner.
+          # Its smoke test is skipped because the binary cannot execute there.
+          - os: macos-13
             target: aarch64-apple-darwin
             cef: macosarm64
             formats: tar.gz
+            cross: true
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             cef: windows64
@@ -82,6 +86,7 @@ jobs:
           --formats ${{ matrix.formats }}
 
       - name: Smoke test the bundle
+        if: ${{ !matrix.cross }}
         shell: bash
         run: |
           set -euo pipefail
