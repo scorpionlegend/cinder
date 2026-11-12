@@ -73,7 +73,12 @@ jobs:
       - name: Build
         env:
           CINDER_CEF_ROOT: ${{ github.workspace }}/cef
-        run: cargo build --release --target ${{ matrix.target }} -p cinder-cli -p cinder-adapter-cef
+        # The `cef` feature is off by default so a plain `cargo build` needs no
+        # CEF headers; a shipped bundle must turn it on or `browse` is missing.
+        run: >
+          cargo build --release --target ${{ matrix.target }}
+          -p cinder-cli -p cinder-adapter-cef
+          --features cinder-cli/cef
 
       - name: Package
         run: >
@@ -99,17 +104,24 @@ jobs:
           case "${{ matrix.target }}" in
             *linux*)
               mkdir -p smoke && tar -xzf dist/cinder-*.tar.gz -C smoke
-              ./smoke/cinder-*/cinder demo > /dev/null
+              bin=./smoke/cinder-*/cinder
               ;;
             *darwin*)
               mkdir -p smoke && tar -xzf dist/cinder-*.tar.gz -C smoke
-              ./smoke/cinder-*/Cinder.app/Contents/MacOS/cinder demo > /dev/null
+              bin=./smoke/cinder-*/Cinder.app/Contents/MacOS/cinder
               ;;
             *windows*)
               mkdir -p smoke && unzip -q dist/cinder-*.zip -d smoke
-              ./smoke/cinder-*/cinder.exe demo > /dev/null
+              bin=./smoke/cinder-*/cinder.exe
               ;;
           esac
+          $bin demo > /dev/null
+          # `demo` runs on the mock engine, so it passes even in a bundle built
+          # without the `cef` feature. Fail if `browse` is missing.
+          if $bin help | grep -q "no web engine"; then
+            echo "bundle was built without the cef feature" >&2
+            exit 1
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
