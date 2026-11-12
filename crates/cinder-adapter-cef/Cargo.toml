@@ -1,0 +1,20 @@
+[package]
+name = "cinder-adapter-cef"
+description = "CEF-backed engine adapter (L0/L1): the only crate that links native code"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints.rust]
+# This crate is the audited native boundary (L0/L1); every other crate forbids
+# unsafe. The exception is scoped here on purpose. Cargo forbids mixing
+# `workspace = true` with overrides, so the workspace lints are restated.
+unsafe_code = "allow"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[dependencies]
+cinder-adapter = { path = "../cinder-adapter" }
