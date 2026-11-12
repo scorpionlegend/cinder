@@ -32,7 +32,12 @@ pub const APPSTREAM_FILE: &str =
 /// installs on both older and newer releases. `libunistring2` is not listed at
 /// all: it no longer exists in Ubuntu 26.04 and was only ever a transitive
 /// dependency of libgnutls30.
-const DEB_DEPENDS: &str = "libc6, libgcc-s1, libx11-6, libxcb1, libxcomposite1, \
+///
+/// `libc6 (>= 2.34)` is the highest glibc symbol the binaries actually use
+/// (Ubuntu 22.04's level). Without the floor apt would happily install on an
+/// older release and the failure would only appear at launch as a missing
+/// symbol.
+const DEB_DEPENDS: &str = "libc6 (>= 2.34), libgcc-s1, libx11-6, libxcb1, libxcomposite1, \
 libxdamage1, libxext6, libxfixes3, libxrandr2, libxkbcommon0, libgbm1, libnss3, \
 libnspr4, libdbus-1-3, libexpat1, libpango-1.0-0, libcairo2, libudev1, \
 libcups2 | libcups2t64, libatk1.0-0 | libatk1.0-0t64, \
