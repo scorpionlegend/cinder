@@ -169,8 +169,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # A tag like v0.1.0-pre.1 is a pre-release; v0.1.0 is not.
+          extra=()
+          case "${GITHUB_REF_NAME}" in
+            *-*) extra+=(--prerelease) ;;
+          esac
           gh release create "${GITHUB_REF_NAME}" \
             --repo "${GITHUB_REPOSITORY}" \
             --title "Cinder ${GITHUB_REF_NAME}" \
             --generate-notes \
+            "${extra[@]}" \
             artifacts/*
