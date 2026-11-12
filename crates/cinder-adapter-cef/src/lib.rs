@@ -63,8 +63,10 @@ pub const EV_PAINTED: i32 = 9;
 pub const EV_BLOCKED: i32 = 10;
 
 mod engine;
+mod runtime;
 
 pub use engine::{measured_capabilities, CefEngine, CefEngineConfig};
+pub use runtime::{prepare as prepare_runtime, root as cef_root, stage as stage_runtime};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CefError {

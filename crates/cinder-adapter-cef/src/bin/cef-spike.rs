@@ -18,24 +18,12 @@ fn main() {
         std::process::exit(code);
     }
 
-    let root = std::env::var("CINDER_CEF_ROOT").unwrap_or_else(|_| {
-        format!("{}/cef", std::env::var("HOME").unwrap_or_else(|_| ".".into()))
-    });
-    let root = PathBuf::from(root);
-    // Chromium resolves its resource files relative to the executable, and a
-    // path containing spaces has already caused trouble here, so prefer the
-    // executable's own directory when the resource files are present there.
-    let exe_dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(PathBuf::from))
-        .unwrap_or_else(|| PathBuf::from("."));
-    let resources = if exe_dir.join("icudtl.dat").exists()
-        && exe_dir.join("v8_context_snapshot.bin").exists()
-    {
-        exe_dir.clone()
-    } else {
-        root.join("Resources")
-    };
+    let root = cinder_adapter_cef::cef_root();
+    // Chromium looks for `icudtl.dat` beside the `libcef.so` it mapped, not in
+    // `resources_dir_path`. Stage the split distribution into one directory and
+    // re-exec with it on the loader path so both land together.
+    let staged = cinder_adapter_cef::prepare_runtime(&root);
+    let resources = staged;
     let locales = resources.join("locales");
     let cache = match std::env::var("CINDER_CEF_CACHE") {
         Ok(v) if !v.is_empty() => PathBuf::from(v),

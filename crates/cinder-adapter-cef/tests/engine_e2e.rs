@@ -7,7 +7,6 @@
 //! Run with:
 //!   CINDER_CEF_ROOT=~/cef cargo test -p cinder-adapter-cef --test engine_e2e
 
-use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use cinder_adapter::command::{Command, CommandOutcome, Surface};
@@ -28,7 +27,6 @@ fn page_url() -> Url {
 }
 
 fn main() {
-    ensure_runtime();
     if let Some(code) = Cef::execute_process() {
         std::process::exit(code);
     }
@@ -42,37 +40,6 @@ fn main() {
     }
     println!("\nengine_e2e: FAIL ({} check(s))", failures.len());
     std::process::exit(1);
-}
-
-/// Chromium resolves `icudtl.dat` next to the loaded `libcef.so`, not next to
-/// the executable and not from `resources_dir_path`. A cargo test binary lives
-/// in `target/`, so the loader would pick `libcef.so` out of the CEF tree where
-/// no ICU data sits beside it. Re-exec once with the merged runtime directory
-/// on `LD_LIBRARY_PATH` so both land in the same place.
-fn ensure_runtime() {
-    let resources = merged_resources(&cef_root());
-    let current = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
-    if current
-        .split(':')
-        .any(|entry| !entry.is_empty() && Path::new(entry) == resources)
-    {
-        return;
-    }
-    let exe = std::env::current_exe().expect("current exe");
-    let status = std::process::Command::new(exe)
-        .env(
-            "LD_LIBRARY_PATH",
-            format!("{}:{}", resources.display(), current),
-        )
-        .status();
-    std::process::exit(status.ok().and_then(|s| s.code()).unwrap_or(1));
-}
-
-fn cef_root() -> PathBuf {
-    PathBuf::from(
-        std::env::var("CINDER_CEF_ROOT")
-            .unwrap_or_else(|_| format!("{}/cef", std::env::var("HOME").unwrap_or_default())),
-    )
 }
 
 struct Check {
@@ -131,7 +98,7 @@ impl Collector {
 }
 
 fn config() -> CefEngineConfig {
-    let resources = merged_resources(&cef_root());
+    let resources = cinder_adapter_cef::prepare_runtime(&cinder_adapter_cef::cef_root());
     let cache = std::env::temp_dir().join("cinder-engine-e2e-cache");
     let _ = std::fs::create_dir_all(&cache);
     CefEngineConfig {
@@ -142,53 +109,10 @@ fn config() -> CefEngineConfig {
             "--disable-gpu".into(),
             "--disable-dev-shm-usage".into(),
             "--ozone-platform=headless".into(),
-            format!("--icu-data-file={}", resources.join("icudtl.dat").display()),
             format!("--user-data-dir={}", cache.display()),
         ],
         capabilities: cinder_adapter_cef::measured_capabilities(),
     }
-}
-
-/// CEF ships its runtime split across `Resources/` and `Release/`; Chromium
-/// wants them in one directory. `cinder-dist` merges them at package time, so
-/// the test does the same. Files are copied rather than symlinked: Chromium
-/// opens the ICU data through a file descriptor and rejects a link here.
-fn merged_resources(root: &Path) -> PathBuf {
-    let dir = std::env::temp_dir().join("cinder-engine-e2e-res");
-    if dir.join(".ready").exists() {
-        return dir;
-    }
-    let _ = std::fs::remove_dir_all(&dir);
-    let _ = std::fs::create_dir_all(&dir);
-    for sub in ["Resources", "Release"] {
-        let Ok(entries) = std::fs::read_dir(root.join(sub)) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let target = dir.join(entry.file_name());
-            let source = entry.path();
-            if source.is_dir() {
-                let _ = copy_dir(&source, &target);
-            } else {
-                let _ = std::fs::copy(&source, &target);
-            }
-        }
-    }
-    let _ = std::fs::write(dir.join(".ready"), b"1");
-    dir
-}
-
-fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(to)?;
-    for entry in std::fs::read_dir(from)?.flatten() {
-        let target = to.join(entry.file_name());
-        if entry.path().is_dir() {
-            copy_dir(&entry.path(), &target)?;
-        } else {
-            std::fs::copy(entry.path(), &target)?;
-        }
-    }
-    Ok(())
 }
 
 fn run() -> Vec<String> {
