@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.cinder.Cinder</id>
+  <name>Cinder</name>
+  <summary>Browse the web</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>Apache-2.0</project_license>
+  <description>
+    <p>Cinder is a web browser built on the Chromium engine, with the components Cinder owns written in Rust.</p>
+  </description>
+  <launchable type="desktop-id">cinder.desktop</launchable>
+  <url type="homepage">https://github.com/scorpionlegend/cinder</url>
+  <provides>
+    <binary>cinder</binary>
+  </provides>
+</component>
