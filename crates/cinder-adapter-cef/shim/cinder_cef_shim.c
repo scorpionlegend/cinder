@@ -412,6 +412,9 @@ int cinder_cef_init(int argc, char** argv, const char* resources_dir,
     cef_string_from_utf8(cache_dir, strlen(cache_dir), &settings.cache_path);
   }
 
+  /* libcef derives its struct-version checks from the first cef_api_hash()
+   * call. The C++ wrapper does this at startup; using the C API directly means
+   * we must do it ourselves, or every CToCpp conversion reports version -1. */
   if (!configure_api_version()) {
     return 0;
   }
