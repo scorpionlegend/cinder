@@ -558,8 +558,14 @@ fn window_args() -> Vec<String> {
     args
 }
 
-fn run_open(target: Option<&str>) -> i32 {
-    use std::cell::RefCell;
+/// Progress notes for the window selftest, matching the window layer's lines.
+fn trace_open(step: &str) {
+    if std::env::var_os("CINDER_WINDOW_SELFTEST").is_some() {
+        eprintln!("window trace: {step}");
+    }
+}
+
+fn run_open(target: Option<&str>) -> i32 {    use std::cell::RefCell;
     use std::rc::Rc;
 
     use cinder_adapter_cef::{CefEngine, CefEngineConfig};
@@ -676,6 +682,7 @@ fn run_open(target: Option<&str>) -> i32 {
         ui,
         move |parent| {
             use cinder_adapter::command::Surface;
+            trace_open("open enter");
             let mut browser = opener.borrow_mut();
             browser.set_surface(Surface::NativeChild {
                 parent: parent.handle,
@@ -684,7 +691,9 @@ fn run_open(target: Option<&str>) -> i32 {
                 height: parent.height,
                 scale: parent.scale,
             });
+            trace_open("surface set");
             let window = browser.open_window();
+            trace_open("window opened");
             match browser.open_tab(window, Some(url.clone())) {
                 Ok(tab) => {
                     println!("web engine : CEF {}", cinder_adapter_cef::Cef::version());

@@ -1067,6 +1067,7 @@ int cinder_cef_create_view(int view_id, const char* url, int width, int height,
     set_error("invalid view size");
     return 0;
   }
+  trace("create_view enter", (long)view_id, (long)parent);
   if (view_by_id(view_id)) {
     set_error("view id already in use");
     return 0;

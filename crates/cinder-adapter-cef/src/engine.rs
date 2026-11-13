@@ -115,6 +115,14 @@ mod ffi {
 }
 
 /// How long one `pump` slice runs before commands are serviced again.
+/// Progress notes for `CINDER_WINDOW_SELFTEST`, matching the window layer's
+/// `window trace:` lines so one log reads as a single sequence.
+fn trace(step: &str) {
+    if std::env::var_os("CINDER_WINDOW_SELFTEST").is_some() {
+        eprintln!("window trace: engine {step}");
+    }
+}
+
 /// Marks the engine core as busy on this thread.
 ///
 /// Pumping CEF runs the platform message loop, which can re-enter the host's
@@ -590,10 +598,14 @@ impl CefEngine {
         let Some(_busy) = CoreBusy::enter() else {
             return Err(AdapterError::EngineFault("engine re-entered".into()));
         };
+        trace("send enter");
         let mut guard = self.core.lock().unwrap_or_else(|e| e.into_inner());
+        trace("send locked");
         if let Some(core) = guard.as_mut() {
             core.pump();
+            trace("send pumped");
             let alive = core.serve(request);
+            trace("send served");
             let result = ack_rx.recv_timeout(ACCEPT_TIMEOUT).unwrap_or_else(|_| {
                 Err(AdapterError::EngineFault(
                     "engine did not accept the command".into(),
