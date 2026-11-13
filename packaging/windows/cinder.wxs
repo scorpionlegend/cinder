@@ -67,7 +67,7 @@
       </Component>
     </DirectoryRef>
 
-    <Feature Id="Main" Title="Cinder" Level="1" Display="expand" AllowAbsent="no">
+    <Feature Id="Main" Title="Cinder" Level="1" Display="expand" Absent="disallow">
       <ComponentGroupRef Id="CinderFiles" />
       <ComponentRef Id="ApplicationShortcut" />
     </Feature>

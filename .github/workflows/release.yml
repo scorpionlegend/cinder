@@ -169,9 +169,14 @@ jobs:
           & "$wix\heat.exe" dir $root -cg CinderFiles -dr INSTALLFOLDER -ag `
             -sfrag -srd -sreg -scom -var var.SourceDir -out files.wxs
           if ($LASTEXITCODE -ne 0) { throw "heat failed" }
+          # candle's -out only accepts a single input file, so compile the two
+          # sources separately and let light link the objects.
           & "$wix\candle.exe" -arch x64 "-dSourceDir=$root" "-dProductVersion=$numeric" `
-            -out obj\ packaging\windows\cinder.wxs files.wxs
-          if ($LASTEXITCODE -ne 0) { throw "candle failed" }
+            -out obj\cinder.wixobj packaging\windows\cinder.wxs
+          if ($LASTEXITCODE -ne 0) { throw "candle failed on cinder.wxs" }
+          & "$wix\candle.exe" -arch x64 "-dSourceDir=$root" `
+            -out obj\files.wixobj files.wxs
+          if ($LASTEXITCODE -ne 0) { throw "candle failed on files.wxs" }
           $msi = "dist\cinder-$version-x86_64-pc-windows-msvc.msi"
           # -sval skips ICE validation; the ICEs that fire here are the benign
           # per-user-shortcut ones, and light treats them as errors.
