@@ -919,6 +919,24 @@ int cinder_cef_go_forward(int view_id) {
   return 1;
 }
 
+/* Whether the history has an entry to move to. The shell greys its buttons
+ * with this instead of guessing from the URLs it has seen. */
+int cinder_cef_can_go_back(int view_id) {
+  cinder_view_t* v = view_by_id(view_id);
+  if (!v || !v->browser) {
+    return 0;
+  }
+  return v->browser->can_go_back(v->browser);
+}
+
+int cinder_cef_can_go_forward(int view_id) {
+  cinder_view_t* v = view_by_id(view_id);
+  if (!v || !v->browser) {
+    return 0;
+  }
+  return v->browser->can_go_forward(v->browser);
+}
+
 int cinder_cef_set_zoom(int view_id, double level) {
   cinder_view_t* v = view_by_id(view_id);
   cef_browser_host_t* host;

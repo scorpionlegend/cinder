@@ -12,6 +12,8 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=CINDER_CEF_ROOT");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_CEF");
+    // Release builds stamp their tag so the updater can compare versions.
+    println!("cargo:rerun-if-env-changed=CINDER_RELEASE_TAG");
 
     if std::env::var_os("CARGO_FEATURE_CEF").is_none() {
         return;

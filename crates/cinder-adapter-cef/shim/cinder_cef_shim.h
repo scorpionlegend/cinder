@@ -64,6 +64,8 @@ int cinder_cef_reload(int view_id);
 int cinder_cef_stop(int view_id);
 int cinder_cef_go_back(int view_id);
 int cinder_cef_go_forward(int view_id);
+int cinder_cef_can_go_back(int view_id);
+int cinder_cef_can_go_forward(int view_id);
 int cinder_cef_set_zoom(int view_id, double level);
 int cinder_cef_set_mute(int view_id, int muted);
 int cinder_cef_find(int view_id, const char* query, int forward);

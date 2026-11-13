@@ -50,6 +50,9 @@ mod ffi {
         pub fn cinder_cef_stop(view_id: c_int) -> c_int;
         pub fn cinder_cef_go_back(view_id: c_int) -> c_int;
         pub fn cinder_cef_go_forward(view_id: c_int) -> c_int;
+        pub fn cinder_cef_can_go_back(view_id: c_int) -> c_int;
+        pub fn cinder_cef_can_go_forward(view_id: c_int) -> c_int;
+        pub fn cinder_cef_view_url(view_id: c_int) -> *const c_char;
         pub fn cinder_cef_set_zoom(view_id: c_int, level: f64) -> c_int;
         pub fn cinder_cef_set_mute(view_id: c_int, muted: c_int) -> c_int;
         pub fn cinder_cef_find(view_id: c_int, query: *const c_char, forward: c_int) -> c_int;
@@ -181,6 +184,17 @@ enum EngineRequest {
     Input {
         view: ViewId,
         event: InputEvent,
+        ack: Sender<bool>,
+    },
+    /// The view's current URL, for the shell's address bar.
+    Url {
+        view: ViewId,
+        ack: Sender<Option<String>>,
+    },
+    /// Whether history can move back (`back`) or forward.
+    History {
+        view: ViewId,
+        back: bool,
         ack: Sender<bool>,
     },
 }
@@ -479,6 +493,45 @@ impl CefEngine {
         }
     }
 
+    /// The view's current URL, as last reported by CEF's address change.
+    /// Returns `None` before the first navigation.
+    pub fn view_url(&self, view: ViewId) -> Option<String> {
+        let (ack_tx, ack_rx) = channel();
+        self.tx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .send(EngineRequest::Url {
+                view,
+                ack: ack_tx,
+            })
+            .ok()?;
+        ack_rx.recv_timeout(FRAME_TIMEOUT).ok().flatten()
+    }
+
+    /// Whether the view's history has an entry behind it.
+    pub fn can_go_back(&self, view: ViewId) -> bool {
+        self.history(view, true)
+    }
+
+    /// Whether the view's history has an entry ahead of it.
+    pub fn can_go_forward(&self, view: ViewId) -> bool {
+        self.history(view, false)
+    }
+
+    fn history(&self, view: ViewId, back: bool) -> bool {
+        let (ack_tx, ack_rx) = channel();
+        self.tx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .send(EngineRequest::History {
+                view,
+                back,
+                ack: ack_tx,
+            })
+            .ok();
+        ack_rx.recv_timeout(FRAME_TIMEOUT).ok().unwrap_or(false)
+    }
+
     /// Copy the view's last painted frame. Returns `None` before the first
     /// paint or once the view is gone.
     pub fn copy_frame(&self, view: ViewId) -> Option<Frame> {
@@ -626,7 +679,40 @@ fn run_engine(
                 EngineRequest::Input { view, event, ack } => {
                     let _ = ack.send(apply_input(view, event));
                 }
+                EngineRequest::Url { view, ack } => {
+                    let _ = ack.send(read_url(view));
+                }
+                EngineRequest::History { view, back, ack } => {
+                    let _ = ack.send(read_history(view, back));
+                }
             }
+        }
+    }
+}
+
+/// The view's current URL, as last reported by CEF's address change.
+fn read_url(view: ViewId) -> Option<String> {
+    // SAFETY: the shim returns a pointer to its own NUL-terminated buffer.
+    let ptr = unsafe { ffi::cinder_cef_view_url(view.get() as c_int) };
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: the pointer is valid until the next shim call on this thread.
+    let text = unsafe { std::ffi::CStr::from_ptr(ptr) }
+        .to_string_lossy()
+        .into_owned();
+    (!text.is_empty()).then_some(text)
+}
+
+/// Whether history can move back (`back`) or forward.
+fn read_history(view: ViewId, back: bool) -> bool {
+    let raw = view.get() as c_int;
+    // SAFETY: plain integer calls into the shim.
+    unsafe {
+        if back {
+            ffi::cinder_cef_can_go_back(raw) != 0
+        } else {
+            ffi::cinder_cef_can_go_forward(raw) != 0
         }
     }
 }

@@ -12,6 +12,9 @@ use cinder_adapter::Capabilities;
 use cinder_adapter_mock::MockEngine;
 use cinder_core::{Browser, Effect, NavigationOutcome};
 
+#[cfg(feature = "window")]
+mod update;
+
 fn main() {
     // CEF re-executes this binary for its subprocesses; they must exit before
     // any argument parsing so a helper process never runs a command.
@@ -27,6 +30,7 @@ fn main() {
         "demo" => run_demo(),
         "browse" => run_browse(args.get(1).map(String::as_str)),
         "open" => run_open(args.get(1).map(String::as_str)),
+        "update" => run_update(),
         other if looks_like_url(other) => run_open(Some(other)),
         "version" | "--version" | "-V" => {
             println!("cinder {} (adapter api 0.1)", env!("CARGO_PKG_VERSION"));
@@ -57,6 +61,7 @@ fn print_help() {
     println!("  cinder open <url>  same as above");
     println!("  cinder demo      run a scripted session: tabs, policy, decisions, restore, shutdown");
     println!("  cinder browse <url>  load a real page headlessly and report the result");
+    println!("  cinder update    check the published releases for a newer version");
     println!("  cinder version   print the version");
     println!("  cinder help      this text");
     println!();
@@ -267,6 +272,50 @@ fn run_demo() -> i32 {
 }
 
 #[cfg(feature = "cef")]
+#[cfg(feature = "window")]
+fn run_update() -> i32 {
+    let install = std::env::args().any(|a| a == "--install");
+    let current = update::current();
+    println!("installed  : {current}");
+    match update::check(&current) {
+        Ok(Some(release)) => {
+            println!("available  : {}", release.version);
+            println!("page       : {}", release.page);
+            if let Some(package) = release.package.as_ref() {
+                println!("package    : {package}");
+            }
+            if !install {
+                println!("run `cinder update --install` to install it");
+                return 0;
+            }
+            match update::install(&release) {
+                Ok(()) => {
+                    println!("installed  : {}", release.version);
+                    0
+                }
+                Err(e) => {
+                    eprintln!("install failed: {e}");
+                    1
+                }
+            }
+        }
+        Ok(None) => {
+            println!("up to date");
+            0
+        }
+        Err(e) => {
+            eprintln!("check failed: {e}");
+            1
+        }
+    }
+}
+
+#[cfg(not(feature = "window"))]
+fn run_update() -> i32 {
+    eprintln!("this build has no updater; rebuild with --features window");
+    2
+}
+
 fn run_browse(target: Option<&str>) -> i32 {
     use cinder_adapter_cef::{CefEngine, CefEngineConfig};
 
@@ -454,11 +503,33 @@ fn run_open(target: Option<&str>) -> i32 {
     let probe = Arc::clone(&engine);
     let debug = std::env::var_os("CINDER_WINDOW_SELFTEST").is_some();
     let mut ticks = 0u32;
+
+    // The update check runs on its own thread: the window must never wait for
+    // the network, and the answer only changes the status strip.
+    let status = Arc::new(std::sync::Mutex::new(String::new()));
+    let (click_tx, click_rx) = std::sync::mpsc::channel();
+    let (found_tx, found_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let installed = update::current();
+    println!("version    : {installed}");
+    if std::env::var_os("CINDER_NO_UPDATE_CHECK").is_none() {
+        let installed = installed.clone();
+        std::thread::spawn(move || {
+            let _ = found_tx.send(update::check(&installed));
+        });
+    }
+    let ui = cinder_window::Ui {
+        status: Arc::clone(&status),
+        clicked: Some(click_tx),
+    };
+    let mut pending: Option<update::Release> = None;
+    let mut installing = false;
+    let mut notice = String::new();
     let options = cinder_window::WindowOptions {
         title: "Cinder".to_string(),
         ..Default::default()
     };
-    let result = cinder_window::run(engine.clone(), view, options, move || {
+    let result = cinder_window::run(engine.clone(), view, options, ui, move || {
         let mut browser = pump.borrow_mut();
         for effect in browser.pump() {
             match effect {
@@ -480,6 +551,52 @@ fn run_open(target: Option<&str>) -> i32 {
                 "  tick {ticks}: frame={:?}",
                 frame.map(|f| (f.width, f.height))
             );
+        }
+
+        match found_rx.try_recv() {
+            Ok(Ok(Some(release))) => {
+                println!(
+                    "update     : {} available ({})",
+                    release.version, release.page
+                );
+                notice = format!(
+                    "Cinder {} is available - click here to install",
+                    release.version
+                );
+                pending = Some(release);
+            }
+            Ok(Err(e)) if debug => {
+                eprintln!("update     : {e}");
+            }
+            _ => {}
+        }
+        if click_rx.try_recv().is_ok() && !installing {
+            if let Some(release) = pending.clone() {
+                installing = true;
+                notice = format!("Installing Cinder {}...", release.version);
+                let done = done_tx.clone();
+                std::thread::spawn(move || {
+                    let _ = done.send(update::install(&release));
+                });
+            }
+        }
+        if let Ok(result) = done_rx.try_recv() {
+            installing = false;
+            match result {
+                Ok(()) => {
+                    notice = "Update installed - restart Cinder".to_string();
+                    pending = None;
+                }
+                Err(e) => {
+                    eprintln!("update     : {e}");
+                    notice = format!("Update failed: {e}");
+                }
+            }
+        }
+        if let Ok(mut slot) = status.lock() {
+            if *slot != notice {
+                *slot = notice.clone();
+            }
         }
     });
 

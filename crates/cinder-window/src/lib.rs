@@ -12,14 +12,20 @@
 //! The event loop stays on the main thread, which is what winit requires; the
 //! engine keeps its own thread and is reached only through channels.
 
+mod chrome;
+mod font;
+
 use std::num::NonZeroU32;
-use std::sync::Arc;
+use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use cinder_adapter::command::Command;
 use cinder_adapter::engine::Engine;
 use cinder_adapter::ids::ViewId;
+use cinder_adapter::sanitize::Url;
 use cinder_adapter_cef::{CefEngine, InputEvent, KeyKind, MouseButton};
+use chrome::{Chrome, Edit, Hit};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton as WinitButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -67,12 +73,25 @@ impl Default for WindowOptions {
     }
 }
 
+/// Hooks the shell uses to talk to the caller's status strip.
+///
+/// The caller owns the update check and runs it on its own thread; it writes
+/// the strip's text here and learns about clicks through the channel.
+#[derive(Debug, Clone, Default)]
+pub struct Ui {
+    /// Text shown in the status strip.
+    pub status: Arc<Mutex<String>>,
+    /// Fired when the user clicks the status strip.
+    pub clicked: Option<Sender<()>>,
+}
+
 /// Run the window until the user closes it. `tick` is called once per frame so
 /// the caller can pump the orchestrator and react to effects.
 pub fn run(
     engine: Arc<CefEngine>,
     view: ViewId,
     options: WindowOptions,
+    ui: Ui,
     tick: impl FnMut() + 'static,
 ) -> Result<(), WindowError> {
     let event_loop = EventLoop::new().map_err(|e| WindowError::EventLoop(e.to_string()))?;
@@ -81,10 +100,13 @@ pub fn run(
         engine,
         view,
         options,
+        ui,
         tick: Box::new(tick),
         window: None,
         surface: None,
         context: None,
+        chrome: Chrome::new(1.0),
+        in_chrome: false,
         modifiers: ModifiersState::empty(),
         cursor: (0.0, 0.0),
         last_size: (0, 0),
@@ -97,7 +119,7 @@ pub fn run(
         selftest: std::env::var("CINDER_WINDOW_SELFTEST")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(300),
+            .unwrap_or(0),
     };
     event_loop
         .run_app(&mut app)
@@ -108,10 +130,15 @@ struct Shell {
     engine: Arc<CefEngine>,
     view: ViewId,
     options: WindowOptions,
+    ui: Ui,
     tick: Box<dyn FnMut()>,
     window: Option<Arc<Window>>,
     context: Option<softbuffer::Context<Arc<Window>>>,
     surface: Option<softbuffer::Surface<Arc<Window>, Arc<Window>>>,
+    /// Toolbar, address field and status strip.
+    chrome: Chrome,
+    /// True while the pointer is over the chrome rather than the page.
+    in_chrome: bool,
     modifiers: ModifiersState,
     cursor: (f64, f64),
     last_size: (u32, u32),
@@ -136,16 +163,100 @@ impl Shell {
             return;
         }
         self.last_size = (width, height);
+        self.chrome.scale = scale;
+        let view_height = height
+            .saturating_sub(self.chrome.toolbar_px())
+            .saturating_sub(self.chrome.status_px())
+            .max(1);
         let _ = self.engine.execute(Command::Resize {
             view: self.view,
             width,
-            height,
+            height: view_height,
             scale,
         });
     }
 
     fn input(&self, event: InputEvent) {
         self.engine.send_input(self.view, event);
+    }
+
+    /// Tell the page the pointer left it, once, when it moves into the chrome.
+    fn page_leave(&self) {
+        self.input(InputEvent::MouseMove {
+            x: self.cursor.0 as i32,
+            y: (self.cursor.1 - self.chrome.toolbar_px() as f64) as i32,
+            modifiers: self.modifiers(),
+            leave: true,
+        });
+    }
+
+    fn size(&self) -> (u32, u32) {
+        self.window
+            .as_ref()
+            .map(|w| {
+                let size = w.inner_size();
+                (size.width, size.height)
+            })
+            .unwrap_or((0, 0))
+    }
+
+    /// What the pointer is over, chrome first.
+    fn hit(&self, x: f64, y: f64) -> Option<Hit> {
+        let (width, height) = self.size();
+        self.chrome
+            .hit(x, y, width)
+            .or_else(|| self.chrome.over_status(y, height).then_some(Hit::Status))
+    }
+
+    fn activate(&mut self, hit: Hit) {
+        match hit {
+            Hit::Back => self.back(),
+            Hit::Forward => self.forward(),
+            Hit::Reload => self.reload(),
+            Hit::Url => {
+                self.chrome.begin_edit();
+                let _ = self.engine.execute(Command::SetFocus {
+                    view: self.view,
+                    focused: false,
+                });
+            }
+            Hit::Status => {
+                if let Some(clicked) = self.ui.clicked.as_ref() {
+                    let _ = clicked.send(());
+                }
+            }
+        }
+    }
+
+    fn back(&mut self) {
+        let _ = self.engine.execute(Command::GoBack { view: self.view });
+    }
+
+    fn forward(&mut self) {
+        let _ = self.engine.execute(Command::GoForward { view: self.view });
+    }
+
+    fn reload(&mut self) {
+        let _ = self.engine.execute(Command::Reload {
+            view: self.view,
+            bypass_cache: false,
+        });
+    }
+
+    /// Navigate to whatever the address field holds.
+    fn navigate(&mut self, text: &str) {
+        let Some(url) = normalize(text) else {
+            return;
+        };
+        self.chrome.cancel_edit();
+        let _ = self.engine.execute(Command::SetFocus {
+            view: self.view,
+            focused: true,
+        });
+        let _ = self.engine.execute(Command::Navigate {
+            view: self.view,
+            url,
+        });
     }
 
     fn present(&mut self) -> &'static str {
@@ -165,20 +276,26 @@ impl Shell {
         let Ok(mut buffer) = surface.buffer_mut() else {
             return "buffer failed";
         };
-        // The frame is BGRA and the buffer is 0x00RRGGBB, so the channels swap
-        // and alpha is dropped: CEF always paints opaque.
-        let stride = frame.width as usize * 4;
-        let rows = (frame.height as usize).min(h.get() as usize);
-        let cols = (frame.width as usize).min(w.get() as usize);
         let width = w.get() as usize;
+        let height = h.get() as usize;
+        let top = self.chrome.toolbar_px() as usize;
+        let bottom = height.saturating_sub(self.chrome.status_px() as usize);
+        buffer.fill(0x00ff_ffff);
+        // The frame is BGRA and the buffer is 0x00RRGGBB, so the channels swap
+        // and alpha is dropped: CEF always paints opaque. It lands below the
+        // toolbar and above the status strip.
+        let stride = frame.width as usize * 4;
+        let cols = (frame.width as usize).min(width);
+        let rows = (frame.height as usize).min(bottom.saturating_sub(top));
         for y in 0..rows {
             let src = &frame.bgra[y * stride..y * stride + cols * 4];
-            let base = y * width;
+            let base = (top + y) * width;
             let dst = &mut buffer[base..base + cols];
             for (out, px) in dst.iter_mut().zip(src.chunks_exact(4)) {
                 *out = ((px[2] as u32) << 16) | ((px[1] as u32) << 8) | px[0] as u32;
             }
         }
+        self.chrome.draw(&mut buffer, w.get(), h.get());
         let presented = buffer.present();
         if presented.is_err() {
             return "present failed";
@@ -304,22 +421,35 @@ impl ApplicationHandler for Shell {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = (position.x, position.y);
-                self.input(InputEvent::MouseMove {
-                    x: position.x as i32,
-                    y: position.y as i32,
-                    modifiers: self.modifiers(),
-                    leave: false,
-                });
+                let hit = self.hit(position.x, position.y);
+                self.chrome.hover = hit;
+                if hit.is_some() {
+                    if !self.in_chrome {
+                        self.in_chrome = true;
+                        self.page_leave();
+                    }
+                } else {
+                    self.in_chrome = false;
+                    self.input(InputEvent::MouseMove {
+                        x: position.x as i32,
+                        y: (position.y - self.chrome.toolbar_px() as f64) as i32,
+                        modifiers: self.modifiers(),
+                        leave: false,
+                    });
+                }
             }
             WindowEvent::CursorLeft { .. } => {
-                self.input(InputEvent::MouseMove {
-                    x: self.cursor.0 as i32,
-                    y: self.cursor.1 as i32,
-                    modifiers: self.modifiers(),
-                    leave: true,
-                });
+                self.chrome.hover = None;
+                self.in_chrome = true;
+                self.page_leave();
             }
             WindowEvent::MouseInput { state, button, .. } => {
+                if let Some(hit) = self.hit(self.cursor.0, self.cursor.1) {
+                    if state == ElementState::Pressed {
+                        self.activate(hit);
+                    }
+                    return;
+                }
                 let button = match button {
                     WinitButton::Left => MouseButton::Left,
                     WinitButton::Middle => MouseButton::Middle,
@@ -328,7 +458,7 @@ impl ApplicationHandler for Shell {
                 };
                 self.input(InputEvent::MouseClick {
                     x: self.cursor.0 as i32,
-                    y: self.cursor.1 as i32,
+                    y: (self.cursor.1 - self.chrome.toolbar_px() as f64) as i32,
                     modifiers: self.modifiers(),
                     button,
                     up: state == ElementState::Released,
@@ -336,6 +466,9 @@ impl ApplicationHandler for Shell {
                 });
             }
             WindowEvent::MouseWheel { delta, .. } => {
+                if self.in_chrome {
+                    return;
+                }
                 // A line is roughly 40 DIP; CEF wants pixel deltas.
                 let (dx, dy) = match delta {
                     MouseScrollDelta::LineDelta(x, y) => {
@@ -345,13 +478,59 @@ impl ApplicationHandler for Shell {
                 };
                 self.input(InputEvent::MouseWheel {
                     x: self.cursor.0 as i32,
-                    y: self.cursor.1 as i32,
+                    y: (self.cursor.1 - self.chrome.toolbar_px() as f64) as i32,
                     modifiers: self.modifiers(),
                     delta_x: dx,
                     delta_y: dy,
                 });
             }
             WindowEvent::KeyboardInput { event, .. } => {
+                if self.chrome.editing {
+                    if event.state == ElementState::Pressed {
+                        match self.chrome.key(&event.logical_key, self.modifiers) {
+                            Edit::Navigate(text) => self.navigate(&text),
+                            Edit::Cancel => {
+                                let _ = self.engine.execute(Command::SetFocus {
+                                    view: self.view,
+                                    focused: true,
+                                });
+                            }
+                            Edit::None => {}
+                        }
+                    }
+                    return;
+                }
+                if event.state == ElementState::Pressed {
+                    let ctrl = self.modifiers.control_key();
+                    let alt = self.modifiers.alt_key();
+                    match &event.logical_key {
+                        Key::Character(c) if ctrl && c.eq_ignore_ascii_case("l") => {
+                            self.chrome.begin_edit();
+                            let _ = self.engine.execute(Command::SetFocus {
+                                view: self.view,
+                                focused: false,
+                            });
+                            return;
+                        }
+                        Key::Character(c) if ctrl && c.eq_ignore_ascii_case("r") => {
+                            self.reload();
+                            return;
+                        }
+                        Key::Named(NamedKey::F5) => {
+                            self.reload();
+                            return;
+                        }
+                        Key::Named(NamedKey::ArrowLeft) if alt => {
+                            self.back();
+                            return;
+                        }
+                        Key::Named(NamedKey::ArrowRight) if alt => {
+                            self.forward();
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
                 let (code, character) = key_code(&event.logical_key);
                 let modifiers = self.modifiers();
                 let kind = match event.state {
@@ -387,10 +566,29 @@ impl ApplicationHandler for Shell {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         (self.tick)();
+        self.ticks += 1;
+        // The address and the history flags come from the engine thread, so
+        // they are polled rather than pushed. Each poll is a round trip that
+        // waits for the engine's current pump slice, so it runs a few times a
+        // second rather than on every frame.
+        if self.ticks % 20 == 0 {
+            if let Some(url) = self.engine.view_url(self.view) {
+                self.chrome.url = url;
+            }
+            self.chrome.back = self.engine.can_go_back(self.view);
+            self.chrome.forward = self.engine.can_go_forward(self.view);
+        }
+        if self.ticks % 30 == 0 {
+            self.chrome.caret_on = !self.chrome.caret_on;
+        }
+        if let Ok(status) = self.ui.status.lock() {
+            if self.chrome.status != *status {
+                self.chrome.status = status.clone();
+            }
+        }
         if let Some(window) = self.window.as_ref() {
             window.request_redraw();
         }
-        self.ticks += 1;
         if self.selftest != 0 && (self.ticks >= self.selftest || self.content) {
             match self.last_frame {
                 Some((w, h, non_white)) => {
@@ -413,6 +611,35 @@ impl ApplicationHandler for Shell {
         event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + TICK));
     }
 }
+
+/// Turn address-field text into a URL: a bare host gets `https://`, and
+/// anything that is not a host becomes a search.
+fn normalize(text: &str) -> Option<Url> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    if let Ok(url) = Url::parse(text) {
+        return Some(url);
+    }
+    if !text.contains(char::is_whitespace) && text.contains('.') {
+        if let Ok(url) = Url::parse(&format!("https://{text}")) {
+            return Some(url);
+        }
+    }
+    let mut query = String::new();
+    for byte in text.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                query.push(byte as char)
+            }
+            b' ' => query.push('+'),
+            other => query.push_str(&format!("%{other:02X}")),
+        }
+    }
+    Url::parse(&format!("https://duckduckgo.com/?q={query}")).ok()
+}
+
 
 /// The eight most common colours in a BGRA frame, as `#rrggbb:count`.
 fn histogram(bgra: &[u8]) -> String {
@@ -466,5 +693,35 @@ fn key_code(key: &Key) -> (i32, u32) {
             }
         }
         _ => (0, 0),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bare_hosts_get_https() {
+        assert_eq!(
+            normalize("example.com").map(|u| u.as_str().to_string()),
+            Some("https://example.com".to_string())
+        );
+        assert_eq!(
+            normalize("  https://example.com/a?b=1  ").map(|u| u.as_str().to_string()),
+            Some("https://example.com/a?b=1".to_string())
+        );
+    }
+
+    #[test]
+    fn other_text_becomes_a_search() {
+        let url = normalize("rust browser").map(|u| u.as_str().to_string()).unwrap_or_default();
+        assert!(url.starts_with("https://duckduckgo.com/?q=rust+browser"), "{url}");
+        let url = normalize("what?").map(|u| u.as_str().to_string()).unwrap_or_default();
+        assert!(url.contains("what%3F"), "{url}");
+    }
+
+    #[test]
+    fn empty_input_is_ignored() {
+        assert!(normalize("   ").is_none());
     }
 }
