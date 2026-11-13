@@ -337,11 +337,8 @@ impl ApplicationHandler for Shell {
         };
         let size = window.inner_size();
         let scale = window.scale_factor() as f32;
-        // CEF's windowed mode embeds a child window, which only this platform's
-        // shell can hand over; elsewhere the parent stays zero, the engine
-        // rejects the view, and the window shows chrome only.
-        #[cfg(not(target_os = "linux"))]
-        let handle: u64 = 0;
+        // CEF's windowed mode embeds a child window, so the shell has to hand
+        // over the platform handle: an X11 window id, an HWND, or an NSView.
         #[cfg(target_os = "linux")]
         let handle = match window.window_handle().map(|h| h.as_raw()) {
             Ok(RawWindowHandle::Xlib(h)) => h.window,
@@ -357,6 +354,36 @@ impl ApplicationHandler for Shell {
                 return;
             }
         };
+        #[cfg(target_os = "windows")]
+        let handle = match window.window_handle().map(|h| h.as_raw()) {
+            Ok(RawWindowHandle::Win32(h)) => h.hwnd.get() as u64,
+            Ok(other) => {
+                eprintln!("cinder: unsupported window handle: {other:?}");
+                event_loop.exit();
+                return;
+            }
+            Err(e) => {
+                eprintln!("cinder: no window handle: {e}");
+                event_loop.exit();
+                return;
+            }
+        };
+        #[cfg(target_os = "macos")]
+        let handle = match window.window_handle().map(|h| h.as_raw()) {
+            Ok(RawWindowHandle::AppKit(h)) => h.ns_view.as_ptr() as u64,
+            Ok(other) => {
+                eprintln!("cinder: unsupported window handle: {other:?}");
+                event_loop.exit();
+                return;
+            }
+            Err(e) => {
+                eprintln!("cinder: no window handle: {e}");
+                event_loop.exit();
+                return;
+            }
+        };
+        #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+        let handle: u64 = 0;
         let view_height = size
             .height
             .saturating_sub(self.chrome.toolbar_px())

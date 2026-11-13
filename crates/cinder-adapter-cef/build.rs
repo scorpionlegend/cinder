@@ -64,6 +64,8 @@ fn main() {
                 release_dir.display()
             );
             println!("cargo:rustc-link-lib=framework=Chromium Embedded Framework");
+            // The shim resizes the browser view with objc_msgSend.
+            println!("cargo:rustc-link-lib=dylib=objc");
         }
         _ => {
             println!("cargo:rustc-link-search=native={}", release_dir.display());

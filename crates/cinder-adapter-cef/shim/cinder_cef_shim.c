@@ -55,6 +55,9 @@ typedef struct {
   /* Non-zero when CEF owns a child window inside the shell's window. */
   int native;
   unsigned long long parent;
+  /* Offset of the child window from the top of the parent, in physical
+   * pixels. Kept so a resize can reposition the child below the toolbar. */
+  int top;
   unsigned char* frame;
   size_t frame_cap;
   char title[512];
@@ -870,6 +873,7 @@ int cinder_cef_create_view(int view_id, const char* url, int width, int height,
   v->height = height;
   v->native = parent != 0;
   v->parent = parent;
+  v->top = top > 0 ? top : 0;
   if (url) {
     snprintf(v->url, sizeof(v->url), "%s", url);
   }
@@ -1060,7 +1064,8 @@ static XDisplay* g_x_display;
 static int (*g_x_resize)(XDisplay*, XWindow, unsigned int, unsigned int);
 static int (*g_x_flush)(XDisplay*);
 
-static int resize_native_window(unsigned long long window, int width, int height) {
+static int resize_native_window(unsigned long long window, int top, int width,
+                                int height) {
   if (!g_x_resize) {
     void* lib = dlopen("libX11.so.6", RTLD_LAZY | RTLD_LOCAL);
     XDisplay* (*open_display)(const char*);
@@ -1082,6 +1087,49 @@ static int resize_native_window(unsigned long long window, int width, int height
   g_x_resize(g_x_display, (XWindow)window, (unsigned int)width,
              (unsigned int)height);
   g_x_flush(g_x_display);
+  (void)top;
+  return 1;
+}
+#elif defined(_WIN32)
+/* The child window lives in the parent's client area, whose origin is the
+ * top-left corner, so the toolbar offset is the y coordinate. */
+static int resize_native_window(unsigned long long window, int top, int width,
+                                int height) {
+  if (!window) {
+    return 0;
+  }
+  return MoveWindow((HWND)(uintptr_t)window, 0, top, width, height, TRUE) ? 1 : 0;
+}
+#elif defined(__APPLE__)
+#include <objc/message.h>
+#include <objc/runtime.h>
+
+/* CGRect is four doubles; passing it by value through objc_msgSend is the
+ * documented way to call a method that takes a struct. */
+typedef struct {
+  double x;
+  double y;
+  double width;
+  double height;
+} cinder_rect;
+
+/* Only the size changes: CEF already placed the view, and its origin is in the
+ * parent view's coordinate system, which this shim does not want to guess. */
+static int resize_native_window(unsigned long long view, int top, int width,
+                                int height) {
+  id target = (id)(uintptr_t)view;
+  cinder_rect frame;
+  (void)top;
+  if (!target) {
+    return 0;
+  }
+  frame = ((cinder_rect(*)(id, SEL))objc_msgSend)(target,
+                                                  sel_registerName("frame"));
+  frame.width = (double)width;
+  frame.height = (double)height;
+  ((void (*)(id, SEL, cinder_rect))objc_msgSend)(target,
+                                                 sel_registerName("setFrame:"),
+                                                 frame);
   return 1;
 }
 #endif
@@ -1102,12 +1150,10 @@ int cinder_cef_resize(int view_id, int width, int height) {
     return 0;
   }
   if (v->native) {
-#if defined(__linux__)
     cef_window_handle_t handle = host->get_window_handle(host);
     if (handle) {
-      resize_native_window((unsigned long long)handle, width, height);
+      resize_native_window((unsigned long long)handle, v->top, width, height);
     }
-#endif
   } else {
     host->was_resized(host);
   }
