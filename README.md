@@ -152,6 +152,32 @@ The demo opens tabs, applies a policy snapshot (host blocklist, HTTPS upgrade),
 answers a permission request, saves and restores a session, and shuts down —
 including the escalation path for a view that refuses to close.
 
+## Shell state
+
+Bookmarks, history and settings live in one profile directory — `$CINDER_STATE_DIR`
+when set, otherwise `~/.local/share/cinder` on Linux, `%APPDATA%\Cinder` on
+Windows and `~/Library/Application Support/Cinder` on macOS:
+
+```sh
+cinder bookmarks add https://example.com/ "Example"
+cinder bookmarks list
+cinder bookmarks remove https://example.com/
+cinder history list
+cinder history clear
+cinder settings set homepage https://example.com/
+cinder settings get homepage
+cinder settings list
+```
+
+The files are tab separated with `%` escaping and are replaced atomically, so a
+crash leaves the previous list rather than a half-written one. History keeps the
+newest 5000 visits.
+
+In the window, `Ctrl+T` opens a tab, `Ctrl+W` closes the active one, `Ctrl+Tab`
+and `Ctrl+Shift+Tab` cycle, and the strip's `+` button opens a tab. Downloads
+are reported as they start and finish; Chromium picks the download directory and
+keeps the suggested file name.
+
 ## Design documents
 
 The architecture, threat model, adapter interface spec, release pipeline and
