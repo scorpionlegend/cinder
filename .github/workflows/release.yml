@@ -137,6 +137,91 @@ jobs:
             exit 1
           fi
 
+      # Windows ships an .msi and a setup .exe on top of the portable .zip.
+      # Both are built from the same staged bundle the smoke test just ran.
+      - name: Build Windows installers
+        if: contains(matrix.target, 'windows')
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = $env:CINDER_VERSION
+          # MSI and the setup .exe only accept numeric versions:
+          # 0.1.0-pre.11 -> 0.1.0.11, 0.1.0 -> 0.1.0.0
+          $base = ($version -split '-')[0]
+          $pre = 0
+          if ($version -match '-pre\.(\d+)$') { $pre = [int]$Matches[1] }
+          $numeric = "$base.$pre"
+
+          $stage = Join-Path $PWD 'stage-win'
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          $zip = (Get-ChildItem dist/cinder-*.zip | Select-Object -First 1).FullName
+          tar -xf $zip -C $stage
+          $root = (Get-ChildItem $stage -Directory | Select-Object -First 1).FullName
+          if (-not (Test-Path (Join-Path $root 'cinder.exe'))) {
+            throw "staged bundle has no cinder.exe"
+          }
+
+          $wix = 'C:\Program Files (x86)\WiX Toolset v3.14\bin'
+          if (-not (Test-Path "$wix\candle.exe")) { throw "WiX 3 not found at $wix" }
+          New-Item -ItemType Directory -Force -Path obj | Out-Null
+          # -ag keeps component GUIDs stable across builds (generated from the
+          # file path at compile time), which is what makes upgrades work.
+          & "$wix\heat.exe" dir $root -cg CinderFiles -dr INSTALLFOLDER -ag `
+            -sfrag -srd -sreg -scom -var var.SourceDir -out files.wxs
+          if ($LASTEXITCODE -ne 0) { throw "heat failed" }
+          & "$wix\candle.exe" -arch x64 "-dSourceDir=$root" "-dProductVersion=$numeric" `
+            -out obj\ packaging\windows\cinder.wxs files.wxs
+          if ($LASTEXITCODE -ne 0) { throw "candle failed" }
+          $msi = "dist\cinder-$version-x86_64-pc-windows-msvc.msi"
+          # -sval skips ICE validation; the ICEs that fire here are the benign
+          # per-user-shortcut ones, and light treats them as errors.
+          & "$wix\light.exe" -sval -out $msi obj\*.wixobj
+          if ($LASTEXITCODE -ne 0) { throw "light failed" }
+
+          # Prove the MSI really carries the browser: an administrative install
+          # unpacks every file without touching Program Files.
+          $admin = Join-Path $PWD 'msi-check'
+          Start-Process msiexec.exe -Wait -ArgumentList @(
+            '/a', "`"$(Resolve-Path $msi).Path`"", '/qn', "TARGETDIR=`"$admin`"")
+          $found = Get-ChildItem $admin -Recurse -Filter cinder.exe -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+          if (-not $found) { throw "administrative install of $msi produced no cinder.exe" }
+
+          $iscc = 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
+          if (-not (Test-Path $iscc)) { throw "Inno Setup not found at $iscc" }
+          $env:CINDER_STAGE_DIR = $root
+          $env:CINDER_WIN_VERSION = $version
+          $env:CINDER_WIN_VERSION_NUMERIC = $numeric
+          $env:CINDER_BUNDLE_VERSION = $version
+          & $iscc "/O$PWD\dist" packaging\windows\cinder.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
+
+          # Same idea for the setup .exe: silent install into a scratch dir,
+          # check the binary landed, then uninstall.
+          $setup = (Resolve-Path "dist\cinder-$version-x86_64-pc-windows-msvc-setup.exe").Path
+          $inst = Join-Path $PWD 'exe-check'
+          Start-Process $setup -Wait -ArgumentList `
+            "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /DIR=`"$inst`""
+          if (-not (Test-Path (Join-Path $inst 'cinder.exe'))) {
+            throw "silent install of $setup produced no cinder.exe"
+          }
+          Start-Process (Join-Path $inst 'unins000.exe') -Wait -ArgumentList `
+            '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART'
+
+          Get-ChildItem dist\*.msi, dist\*-setup.exe | Format-Table Name, Length
+
+      # macOS ships a .dmg alongside the portable .tar.gz.
+      - name: Build dmg
+        if: contains(matrix.target, 'darwin')
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dmg-stage
+          tar -xzf dist/cinder-*.tar.gz -C dmg-stage
+          app=$(echo dmg-stage/cinder-*/Cinder.app)
+          packaging/macos/make-dmg.sh "$app" "Cinder ${CINDER_VERSION}" \
+            "dist/cinder-${CINDER_VERSION}-${{ matrix.target }}.dmg"
+
       - uses: actions/upload-artifact@v4
         with:
           name: cinder-${{ matrix.target }}
@@ -144,6 +229,9 @@ jobs:
             dist/*.tar.gz
             dist/*.zip
             dist/*.deb
+            dist/*.msi
+            dist/*-setup.exe
+            dist/*.dmg
             dist/*.manifest.json
           if-no-files-found: error
 

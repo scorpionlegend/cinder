@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  WiX 3 source for the per-machine Cinder MSI.
+
+  The file list is not written by hand: `heat dir` harvests the staged bundle
+  into files.wxs at build time, so a new CEF runtime file shows up in the
+  installer without touching this file. Everything below is the part heat
+  cannot generate: product identity, install scope, upgrade behaviour and the
+  Start Menu shortcut.
+
+  ProductVersion is passed in as a numeric four-part version because MSI
+  rejects the pre-release suffix (`0.1.0-pre.11` becomes `0.1.0.11`).
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product
+      Id="*"
+      Name="Cinder"
+      Language="1033"
+      Version="$(var.ProductVersion)"
+      Manufacturer="Allen Schoepflin"
+      UpgradeCode="478D57CB-EAFC-48A8-AA8E-64C05A53309D">
+
+    <Package
+        InstallerVersion="500"
+        Compressed="yes"
+        InstallScope="perMachine"
+        Platform="x64"
+        Description="Cinder web browser"
+        Comments="Cinder is a web browser built on the Chromium engine through CEF." />
+
+    <!-- One product code per build, one upgrade code forever: installing a
+         newer MSI replaces the older one instead of stacking side by side. -->
+    <MajorUpgrade
+        DowngradeErrorMessage="A newer version of Cinder is already installed."
+        AllowSameVersionUpgrades="yes" />
+
+    <MediaTemplate EmbedCab="yes" />
+
+    <Property Id="ARPNOMODIFY" Value="1" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/scorpionlegend/cinder" />
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder">
+        <Directory Id="INSTALLFOLDER" Name="Cinder" />
+      </Directory>
+      <Directory Id="ProgramMenuFolder">
+        <Directory Id="ApplicationProgramsFolder" Name="Cinder" />
+      </Directory>
+    </Directory>
+
+    <DirectoryRef Id="ApplicationProgramsFolder">
+      <Component Id="ApplicationShortcut" Guid="4446E87A-665B-4185-9578-67579079AEFE">
+        <Shortcut
+            Id="StartMenuShortcut"
+            Name="Cinder"
+            Description="Cinder web browser"
+            Target="[INSTALLFOLDER]cinder.exe"
+            WorkingDirectory="INSTALLFOLDER" />
+        <RemoveFolder Id="RemoveApplicationProgramsFolder" On="uninstall" />
+        <RegistryValue
+            Root="HKCU"
+            Key="Software\Cinder"
+            Name="StartMenuShortcut"
+            Type="integer"
+            Value="1"
+            KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
+    <Feature Id="Main" Title="Cinder" Level="1" Display="expand" AllowAbsent="no">
+      <ComponentGroupRef Id="CinderFiles" />
+      <ComponentRef Id="ApplicationShortcut" />
+    </Feature>
+  </Product>
+</Wix>

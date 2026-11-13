@@ -38,13 +38,23 @@ the pinned CEF runtime, so nothing has to be installed separately.
 
 | Target | Artifact |
 | --- | --- |
-| Windows x86_64 | `cinder-<version>-x86_64-pc-windows-msvc.zip` |
-| macOS x86_64 / arm64 | `cinder-<version>-<triple>.tar.gz` containing `Cinder.app` |
+| Windows x86_64 | `cinder-<version>-x86_64-pc-windows-msvc.msi` (installer), `cinder-<version>-x86_64-pc-windows-msvc-setup.exe` (installer), and the portable `.zip` |
+| macOS x86_64 / arm64 | `cinder-<version>-<triple>.dmg` (drag-to-Applications image) and the portable `.tar.gz` containing `Cinder.app` |
 | Linux x86_64 / arm64 | `cinder-<version>-<triple>.tar.gz` and `cinder_<version>_<arch>.deb` |
 | Fedora / RHEL / openSUSE | `cinder-<version>-1.<arch>.rpm`, built from the same Linux bundle |
 
 The portable tarball is the fallback that works on any glibc distribution; the
-`.deb` and `.rpm` only add desktop-entry and `PATH` integration.
+`.deb` and `.rpm` only add desktop-entry and `PATH` integration. The Windows
+installers put the bundle in `Program Files\Cinder` with Start Menu and
+uninstall entries; the `.dmg` holds `Cinder.app` next to an `/Applications`
+symlink. None of the installers are code-signed yet, so Windows SmartScreen and
+macOS Gatekeeper will warn on first launch.
+
+`crates/cinder-dist` builds the archives and the `.deb`; the installers are
+assembled from the same bundle in CI — WiX 3 (`packaging/windows/cinder.wxs`)
+for the `.msi`, Inno Setup (`packaging/windows/cinder.iss`) for the setup
+`.exe`, and `hdiutil` (`packaging/macos/make-dmg.sh`) for the `.dmg`. Each one
+is installed or mounted again in the workflow before it is uploaded.
 
 `crates/cinder-dist` builds these. It streams the runtime straight from the CEF
 distribution into the archive, so packaging does not need a staging copy:
