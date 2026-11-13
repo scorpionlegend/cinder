@@ -15,6 +15,15 @@ use cinder_core::{Browser, Effect, NavigationOutcome};
 #[cfg(feature = "window")]
 mod update;
 
+/// The version this binary was published as: the release tag when the build
+/// baked one in, otherwise the crate version.
+fn version_string() -> &'static str {
+    match option_env!("CINDER_RELEASE_TAG") {
+        Some(tag) if !tag.is_empty() => tag.trim_start_matches('v'),
+        _ => env!("CARGO_PKG_VERSION"),
+    }
+}
+
 fn main() {
     // CEF re-executes this binary for its subprocesses; they must exit before
     // any argument parsing so a helper process never runs a command.
@@ -33,7 +42,7 @@ fn main() {
         "update" => run_update(),
         other if looks_like_url(other) => run_open(Some(other)),
         "version" | "--version" | "-V" => {
-            println!("cinder {} (adapter api 0.1)", env!("CARGO_PKG_VERSION"));
+            println!("cinder {} (adapter api 0.1)", version_string());
             0
         }
         "help" | "--help" | "-h" => {
