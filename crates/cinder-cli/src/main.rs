@@ -40,6 +40,17 @@ fn main() {
         std::process::exit(code);
     }
 
+    // Diagnostic hook for CI: try one CEF initialization variant and report it.
+    // A crash inside libcef takes the whole process down, so the caller reads
+    // the exit code and every variant runs in its own process.
+    #[cfg(feature = "cef")]
+    if let Some(probe) = std::env::var_os("CINDER_CEF_PROBE") {
+        let code = run_probe(&probe.to_string_lossy());
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        std::process::exit(code);
+    }
+
     let args: Vec<String> = std::env::args().skip(1).collect();
     // No arguments means the desktop entry was clicked: open the window rather
     // than printing help into a terminal nobody can see.
@@ -70,6 +81,71 @@ fn main() {
     use std::io::Write;
     let _ = std::io::stdout().flush();
     std::process::exit(code);
+}
+
+/// Try one CEF initialization variant, selected by `CINDER_CEF_PROBE`.
+///
+/// The window selftest runs each variant in its own process: a crash inside
+/// libcef kills the process, so the exit code is the result. This exists to
+/// tell a thread-affinity problem apart from a settings or GPU problem.
+#[cfg(feature = "cef")]
+fn run_probe(name: &str) -> i32 {
+    use cinder_adapter_cef::{Cef, CefEngine, CefEngineConfig};
+
+    let staged = cinder_adapter_cef::prepare_runtime(&cinder_adapter_cef::cef_root());
+    let cache = std::env::temp_dir().join("cinder-probe-cache");
+    let mut config = CefEngineConfig {
+        resources_dir: staged.clone(),
+        locales_dir: staged.join("locales"),
+        cache_dir: cache,
+        extra_args: window_args(),
+        windowless: false,
+        capabilities: cinder_adapter_cef::measured_capabilities(),
+    };
+    match name {
+        // CEF documents the main thread as the only valid one to initialize on.
+        "main" | "main-windowless" => {
+            let windowless = name == "main-windowless";
+            match Cef::init_with_args_mode(
+                &config.resources_dir,
+                &config.locales_dir,
+                &config.cache_dir,
+                &config.extra_args,
+                windowless,
+            ) {
+                Ok(_) => {
+                    println!("probe {name}: init ok");
+                    0
+                }
+                Err(e) => {
+                    println!("probe {name}: init failed: {e}");
+                    1
+                }
+            }
+        }
+        "thread" | "thread-windowless" | "single" | "inproc" => {
+            config.windowless = name == "thread-windowless";
+            match name {
+                "single" => config.extra_args.push("--single-process".into()),
+                "inproc" => config.extra_args.push("--in-process-gpu".into()),
+                _ => {}
+            }
+            match CefEngine::new(config) {
+                Ok(_) => {
+                    println!("probe {name}: init ok");
+                    0
+                }
+                Err(e) => {
+                    println!("probe {name}: init failed: {e}");
+                    1
+                }
+            }
+        }
+        other => {
+            println!("probe {other}: unknown variant");
+            2
+        }
+    }
 }
 
 fn print_help() {

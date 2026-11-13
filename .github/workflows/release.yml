@@ -172,6 +172,31 @@ jobs:
           if ! grep -q "window selftest: .*view=view-" <<<"$out"; then
             echo "::warning::the window never got a page view (exit $code)"
           fi
+          # Each probe initializes CEF one way and exits; the exit code says
+          # whether that variant survived. Together they separate a thread
+          # affinity problem from a settings, GPU or windowless one.
+          for v in main main-windowless thread thread-windowless single inproc; do
+            p=$(CINDER_CEF_PROBE=$v CINDER_NO_UPDATE_CHECK=1 $bin about:blank 2>&1) && pc=0 || pc=$?
+            echo "probe $v exit=$pc"
+            echo "$p" | grep -E "^probe|shim init" | tail -3
+          done
+          # `browse` uses the same engine without a window: if it also dies the
+          # fault is in initialization, not in the native parent handoff.
+          b=$(CINDER_NO_UPDATE_CHECK=1 timeout 60 $bin browse about:blank 2>&1) && bc=0 || bc=$?
+          echo "browse exit=$bc"
+          echo "$b" | tail -15
+
+      # A SIGTRAP inside Chromium leaves no log line, but lldb stops on it and
+      # can print the stack. Batch mode runs the selftest and dumps the frames.
+      - name: Window selftest backtrace
+        if: always() && contains(matrix.target, 'darwin')
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin=$(echo ./smoke/cinder-*/Cinder.app/Contents/MacOS/cinder)
+          lldb -b -o "settings set target.env-vars CINDER_WINDOW_SELFTEST=8 CINDER_NO_UPDATE_CHECK=1" \
+            -o run -o "thread backtrace" -o quit -- "$bin" about:blank 2>&1 | tail -80
 
       # A SIGTRAP inside Chromium leaves no log line, but macOS writes a crash
       # report. Print the newest ones so the faulting frame is in the job log.
@@ -185,8 +210,8 @@ jobs:
             echo "no crash report directory"
             exit 0
           fi
-          ls -t "$dir" | head -10
-          for f in $(ls -t "$dir"/*.ips 2>/dev/null | head -2); do
+          find "$dir" -name '*.ips' -newermt '-15 minutes' | head -10
+          for f in $(find "$dir" -name '*.ips' -newermt '-15 minutes' | head -2); do
             echo "=== $f ==="
             head -c 40000 "$f"
             echo
