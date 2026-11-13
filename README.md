@@ -14,7 +14,9 @@ Early implementation. The typed adapter, the orchestrator, the mock engine and
 the CEF-backed adapter (L0/L1) exist, and the CEF off-screen render spike passes.
 `cinder` opens a real window: a toolbar with back, forward, reload and an address
 field, and the page itself is a native CEF child window, so Chromium paints and
-handles input directly. Still missing: tabs, bookmarks, downloads, settings and
+handles input directly. The embedding path is Linux/X11 for now (XWayland on a
+Wayland session); the macOS and Windows bundles build and open the shell but do
+not yet host a page. Still missing: tabs, bookmarks, downloads, settings and
 the full Chrome-style chrome.
 
 | Crate | Role |
