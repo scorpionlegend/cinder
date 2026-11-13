@@ -30,7 +30,7 @@ pub fn root() -> PathBuf {
         .ok()
         .and_then(|exe| exe.parent().map(Path::to_path_buf))
     {
-        if dir.join("icudtl.dat").exists() {
+        if has_runtime(&dir) {
             return dir;
         }
     }
@@ -38,6 +38,18 @@ pub fn root() -> PathBuf {
         .or_else(|_| std::env::var("USERPROFILE"))
         .unwrap_or_default();
     PathBuf::from(home).join("cef")
+}
+
+/// Whether `dir` is a flat bundle with both the ICU data and a CEF library.
+///
+/// A build directory can hold `icudtl.dat` and the pak files without the
+/// library, and staging that copy leaves CEF unable to load at all, so the
+/// check requires the library too.
+fn has_runtime(dir: &Path) -> bool {
+    dir.join("icudtl.dat").is_file()
+        && (dir.join("libcef.so").is_file()
+            || dir.join("libcef.dll").is_file()
+            || dir.join("Chromium Embedded Framework.framework").is_dir())
 }
 
 /// Merge the CEF runtime under `root` into `dest`, returning `dest`.
@@ -188,6 +200,16 @@ pub fn prepare(root: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_bundle_needs_both_icu_and_the_library() {
+        let dir = scratch("has-runtime");
+        std::fs::write(dir.join("icudtl.dat"), b"icu").unwrap();
+        assert!(!has_runtime(&dir), "icu alone is not a bundle");
+        std::fs::write(dir.join("libcef.so"), b"cef").unwrap();
+        assert!(has_runtime(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("cinder-stage-{name}-{}", std::process::id()));

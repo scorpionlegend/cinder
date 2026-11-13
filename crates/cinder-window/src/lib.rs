@@ -13,6 +13,8 @@
 mod chrome;
 mod font;
 
+pub use chrome::TabChip;
+
 use std::num::NonZeroU32;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
@@ -157,6 +159,56 @@ pub fn run(
     run_on(event_loop, engine, options, ui, open, tick)
 }
 
+/// Tab operations the shell delegates to the caller, which owns the browser.
+///
+/// The window layer never sees `TabId`; it passes back the opaque key the host
+/// returned when the tab was opened.
+pub struct TabHost {
+    /// Open a tab and create its view. The shell switches to it.
+    pub open: Box<dyn FnMut(NativeParent) -> Option<(u64, ViewId)>>,
+    /// Make an existing tab current and return its view.
+    pub activate: Box<dyn FnMut(u64) -> Option<ViewId>>,
+    /// Close a tab and release its view.
+    pub close: Box<dyn FnMut(u64)>,
+    /// Current tabs, left to right, with the active one flagged.
+    pub list: Box<dyn Fn() -> Vec<(u64, TabChip)>>,
+}
+
+impl std::fmt::Debug for TabHost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TabHost")
+    }
+}
+
+impl TabHost {
+    /// A host with no tabs: the strip is not drawn and the shortcuts do
+    /// nothing, which is what the single-page selftest wants.
+    pub fn disabled() -> Self {
+        Self {
+            open: Box::new(|_| None),
+            activate: Box::new(|_| None),
+            close: Box::new(|_| {}),
+            list: Box::new(Vec::new),
+        }
+    }
+}
+
+/// Like [`run`], but with a tab strip driven by `tabs`.
+///
+/// `open` creates the first tab and returns its key and view; the host's
+/// `list` supplies the strip contents from then on.
+pub fn run_with_tabs(
+    engine: Arc<CefEngine>,
+    options: WindowOptions,
+    ui: Ui,
+    open: impl FnOnce(NativeParent) -> Option<(u64, ViewId)> + 'static,
+    tick: impl FnMut() + 'static,
+    tabs: TabHost,
+) -> Result<(), WindowError> {
+    let event_loop = event_loop()?;
+    run_on_with_tabs(event_loop, engine, options, ui, open, tick, tabs)
+}
+
 /// Run the window on an event loop the caller already built.
 pub fn run_on(
     event_loop: EventLoop<()>,
@@ -166,10 +218,37 @@ pub fn run_on(
     open: impl FnOnce(NativeParent) -> Option<ViewId> + 'static,
     tick: impl FnMut() + 'static,
 ) -> Result<(), WindowError> {
+    run_on_with_tabs(
+        event_loop,
+        engine,
+        options,
+        ui,
+        move |parent| open(parent).map(|view| (0, view)),
+        tick,
+        TabHost::disabled(),
+    )
+}
+
+/// Run the window on an existing loop with a tab strip.
+pub fn run_on_with_tabs(
+    event_loop: EventLoop<()>,
+    engine: Arc<CefEngine>,
+    options: WindowOptions,
+    ui: Ui,
+    open: impl FnOnce(NativeParent) -> Option<(u64, ViewId)> + 'static,
+    tick: impl FnMut() + 'static,
+    tabs: TabHost,
+) -> Result<(), WindowError> {
     event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + TICK));
     let mut app = Shell {
         engine,
         view: None,
+        views: std::collections::HashMap::new(),
+        keys: Vec::new(),
+        active: None,
+        tabs,
+        handle: None,
+        quit: false,
         open: Some(Box::new(open)),
         options,
         ui,
@@ -207,11 +286,26 @@ pub fn run_on(
         .map_err(|e| WindowError::EventLoop(e.to_string()))
 }
 
+/// The first page's opener, kept until the window handle exists.
+type Opener = Box<dyn FnOnce(NativeParent) -> Option<(u64, ViewId)>>;
+
 struct Shell {
     engine: Arc<CefEngine>,
     /// Set once the window exists and `open` has created the page.
     view: Option<ViewId>,
-    open: Option<Box<dyn FnOnce(NativeParent) -> Option<ViewId>>>,
+    /// Every open tab's view, keyed by the host's opaque tab key.
+    views: std::collections::HashMap<u64, ViewId>,
+    /// Tab keys in strip order.
+    keys: Vec<u64>,
+    /// The key of the tab whose view is showing.
+    active: Option<u64>,
+    /// Tab operations, delegated to the caller.
+    tabs: TabHost,
+    /// The window's platform handle, kept so new tabs can be parented.
+    handle: Option<u64>,
+    /// Set when the last tab closed, so the loop exits after this frame.
+    quit: bool,
+    open: Option<Opener>,
     options: WindowOptions,
     ui: Ui,
     tick: Box<dyn FnMut()>,
@@ -244,7 +338,7 @@ impl Shell {
         self.last_size = (width, height);
         self.chrome.scale = scale;
         let view_height = height
-            .saturating_sub(self.chrome.toolbar_px())
+            .saturating_sub(self.chrome.chrome_px())
             .saturating_sub(self.chrome.status_px())
             .max(1);
         let _ = self.engine.execute(Command::Resize {
@@ -292,7 +386,132 @@ impl Shell {
                     let _ = clicked.send(());
                 }
             }
+            Hit::Tab(index) => {
+                if let Some(key) = self.keys.get(index).copied() {
+                    self.switch_to(key);
+                }
+            }
+            Hit::TabClose(index) => {
+                if let Some(key) = self.keys.get(index).copied() {
+                    self.close_tab(key);
+                }
+            }
+            Hit::NewTab => self.new_tab(),
         }
+    }
+
+    /// Show the tab's view and hide the one that was showing.
+    fn switch_to(&mut self, key: u64) {
+        if self.active == Some(key) {
+            return;
+        }
+        let view = match self.views.get(&key).copied() {
+            Some(view) => view,
+            None => match (self.tabs.activate)(key) {
+                Some(view) => {
+                    self.views.insert(key, view);
+                    view
+                }
+                None => return,
+            },
+        };
+        if let Some(old) = self.view {
+            let _ = self.engine.execute(Command::SetVisible {
+                view: old,
+                visible: false,
+            });
+        }
+        self.view = Some(view);
+        self.active = Some(key);
+        let _ = self.engine.execute(Command::SetVisible {
+            view,
+            visible: true,
+        });
+        let _ = self.engine.execute(Command::SetFocus {
+            view,
+            focused: true,
+        });
+        // The new view was created at the size the window had then; make sure
+        // it matches the current one before it paints.
+        let (width, height) = self.size();
+        self.last_size = (0, 0);
+        self.resize_view(width, height, self.chrome.scale);
+    }
+
+    /// Open a tab through the host and switch to it.
+    fn new_tab(&mut self) {
+        let Some(parent) = self.parent() else {
+            return;
+        };
+        let Some((key, view)) = (self.tabs.open)(parent) else {
+            return;
+        };
+        self.views.insert(key, view);
+        self.keys.push(key);
+        self.switch_to(key);
+    }
+
+    /// Close a tab, then fall back to a neighbour or close the window.
+    fn close_tab(&mut self, key: u64) {
+        let index = self.keys.iter().position(|k| *k == key);
+        (self.tabs.close)(key);
+        if let Some(view) = self.views.remove(&key) {
+            let _ = self.engine.execute(Command::CloseView { view, force: false });
+        }
+        self.keys.retain(|k| *k != key);
+        if self.active != Some(key) {
+            return;
+        }
+        self.view = None;
+        self.active = None;
+        let next = index
+            .and_then(|i| self.keys.get(i).copied().or_else(|| self.keys.last().copied()));
+        match next {
+            Some(key) => self.switch_to(key),
+            None => {
+                // Last tab closed: the window has nothing left to show.
+                if let Some(window) = self.window.as_ref() {
+                    window.request_redraw();
+                }
+                self.quit = true;
+            }
+        }
+    }
+
+    /// Move to the next or previous tab, wrapping at the ends.
+    fn cycle_tab(&mut self, delta: isize) {
+        if self.keys.len() < 2 {
+            return;
+        }
+        let Some(active) = self.active else {
+            return;
+        };
+        let Some(index) = self.keys.iter().position(|k| *k == active) else {
+            return;
+        };
+        let len = self.keys.len() as isize;
+        let next = (index as isize + delta).rem_euclid(len) as usize;
+        if let Some(key) = self.keys.get(next).copied() {
+            self.switch_to(key);
+        }
+    }
+
+    /// The parent handle and geometry for a new page, if the window exists.
+    fn parent(&self) -> Option<NativeParent> {
+        self.window.as_ref()?;
+        let handle = self.handle?;
+        let (width, height) = self.size();
+        let view_height = height
+            .saturating_sub(self.chrome.chrome_px())
+            .saturating_sub(self.chrome.status_px())
+            .max(1);
+        Some(NativeParent {
+            handle,
+            top: self.chrome.chrome_px(),
+            width: width.max(1),
+            height: view_height,
+            scale: self.chrome.scale,
+        })
     }
 
     fn back(&mut self) {
@@ -447,30 +666,38 @@ impl ApplicationHandler for Shell {
         let handle: u64 = 0;
         let view_height = size
             .height
-            .saturating_sub(self.chrome.toolbar_px())
+            .saturating_sub(self.chrome.chrome_px())
             .saturating_sub(self.chrome.status_px())
             .max(1);
         let parent = NativeParent {
             handle,
-            top: self.chrome.toolbar_px(),
+            top: self.chrome.chrome_px(),
             width: size.width.max(1),
             height: view_height,
             scale,
         };
+        self.handle = Some(handle);
         trace(&format!(
             "window ready: handle={handle:#x} size={}x{} view_height={view_height}",
             size.width, size.height
         ));
-        let view = self.open.take().and_then(|open| open(parent));
-        let Some(view) = view else {
+        let opened = self.open.take().and_then(|open| open(parent));
+        let Some((key, view)) = opened else {
             eprintln!("cinder: could not create the page");
             event_loop.exit();
             return;
         };
         trace(&format!("view created: {view:?}"));
         self.view = Some(view);
+        self.views.insert(key, view);
+        self.keys.push(key);
+        self.active = Some(key);
         self.last_size = (size.width, size.height);
         self.chrome.scale = scale;
+        self.chrome.tabs = (self.tabs.list)()
+            .into_iter()
+            .map(|(_, chip)| chip)
+            .collect();
         // A windowed browser is visible as soon as it is created; this only
         // makes the intent explicit and is harmless if CEF already showed it.
         let _ = self.engine.execute(Command::SetVisible {
@@ -558,6 +785,20 @@ impl ApplicationHandler for Shell {
                         Key::Character(c) if ctrl && c.eq_ignore_ascii_case("r") => {
                             self.reload();
                         }
+                        Key::Character(c) if ctrl && c.eq_ignore_ascii_case("t") => {
+                            self.new_tab();
+                        }
+                        Key::Character(c) if ctrl && c.eq_ignore_ascii_case("w") => {
+                            if let Some(key) = self.active {
+                                self.close_tab(key);
+                            }
+                        }
+                        Key::Named(NamedKey::Tab) if ctrl && self.modifiers.shift_key() => {
+                            self.cycle_tab(-1);
+                        }
+                        Key::Named(NamedKey::Tab) if ctrl => {
+                            self.cycle_tab(1);
+                        }
                         Key::Named(NamedKey::F5) => {
                             self.reload();
                         }
@@ -576,6 +817,10 @@ impl ApplicationHandler for Shell {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if self.quit {
+            event_loop.exit();
+            return;
+        }
         if self.selftest != 0 {
             trace(&format!("tick {} before pump", self.ticks));
         }
@@ -589,6 +834,12 @@ impl ApplicationHandler for Shell {
             trace(&format!("tick {} after pump", self.ticks));
         }
         self.ticks += 1;
+        // The strip is small and the host owns the model, so it is refreshed
+        // every frame rather than pushed through a channel.
+        self.chrome.tabs = (self.tabs.list)()
+            .into_iter()
+            .map(|(_, chip)| chip)
+            .collect();
         // The address and the history flags come from the engine thread, so
         // they are polled rather than pushed. Each poll is a round trip that
         // waits for the engine's current pump slice, so it runs a few times a

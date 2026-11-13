@@ -16,10 +16,15 @@ use crate::font;
 
 /// Toolbar height in logical pixels.
 pub const TOOLBAR: f32 = 40.0;
+/// Tab strip height in logical pixels.
+pub const TABSTRIP: f32 = 32.0;
 /// Status strip height in logical pixels.
 pub const STATUS: f32 = 22.0;
 
 const TOOLBAR_BG: u32 = 0x00f2f2f4;
+const TABSTRIP_BG: u32 = 0x00e4e4ea;
+const TAB_ACTIVE: u32 = 0x00f2f2f4;
+const TAB_IDLE: u32 = 0x00d6d6dd;
 const TOOLBAR_LINE: u32 = 0x00d8d8dd;
 const BUTTON_HOVER: u32 = 0x00dedee4;
 const BUTTON_GLYPH: u32 = 0x003a3a40;
@@ -41,6 +46,19 @@ pub enum Hit {
     Reload,
     Url,
     Status,
+    /// The body of a tab in the strip, by index.
+    Tab(usize),
+    /// The close box of a tab in the strip, by index.
+    TabClose(usize),
+    /// The `+` button that opens a new tab.
+    NewTab,
+}
+
+/// One tab as the strip draws it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TabChip {
+    pub title: String,
+    pub active: bool,
 }
 
 /// What the address field wants the shell to do after a key press.
@@ -76,6 +94,8 @@ pub struct Chrome {
     pub select_all: bool,
     /// Blink phase for the caret.
     pub caret_on: bool,
+    /// Tabs to draw in the strip, left to right.
+    pub tabs: Vec<TabChip>,
 }
 
 impl Chrome {
@@ -92,12 +112,23 @@ impl Chrome {
             caret: 0,
             select_all: false,
             caret_on: true,
+            tabs: Vec::new(),
         }
+    }
+
+    /// Tab strip height in device pixels.
+    pub fn tabstrip_px(&self) -> u32 {
+        (TABSTRIP * self.scale).round() as u32
     }
 
     /// Toolbar height in device pixels.
     pub fn toolbar_px(&self) -> u32 {
         (TOOLBAR * self.scale).round() as u32
+    }
+
+    /// Everything above the page: tab strip plus toolbar.
+    pub fn chrome_px(&self) -> u32 {
+        self.tabstrip_px() + self.toolbar_px()
     }
 
     /// Status strip height in device pixels.
@@ -117,6 +148,7 @@ impl Chrome {
     fn metrics(&self, width: u32) -> Metrics {
         let s = self.scale;
         let px = |v: f32| (v * s).round() as u32;
+        let top = self.tabstrip_px();
         let toolbar = self.toolbar_px();
         let button = px(28.0);
         let gap = px(6.0);
@@ -127,16 +159,25 @@ impl Chrome {
         let reload = forward + button + gap;
         let field_x = reload + button + gap * 2;
         let field_w = width.saturating_sub(field_x + margin);
+        // Tabs share the strip with the `+` button, capped so a single tab does
+        // not stretch across the window.
+        let new_tab_w = px(28.0);
+        let avail = width.saturating_sub(margin * 2 + new_tab_w + gap);
+        let count = self.tabs.len().max(1) as u32;
+        let tab_w = (avail / count).min(px(220.0)).max(px(60.0));
         Metrics {
+            top,
             toolbar,
             button,
             field_x,
             field_w,
-            field_y: toolbar.saturating_sub(field_h) / 2,
+            field_y: top + toolbar.saturating_sub(field_h) / 2,
             field_h,
             back,
             forward,
             reload,
+            tab_w,
+            new_tab: margin + tab_w * self.tabs.len() as u32 + gap,
         }
     }
 
@@ -145,7 +186,26 @@ impl Chrome {
         let m = self.metrics(width);
         let x = x as u32;
         let y = y as u32;
-        if y < m.toolbar {
+        if y < m.top {
+            let margin = (8.0 * self.scale).round() as u32;
+            if x < margin {
+                return None;
+            }
+            let index = ((x - margin) / m.tab_w.max(1)) as usize;
+            if index < self.tabs.len() {
+                let within = (x - margin) % m.tab_w.max(1);
+                let close = m.tab_w.saturating_sub((22.0 * self.scale).round() as u32);
+                if within >= close {
+                    return Some(Hit::TabClose(index));
+                }
+                return Some(Hit::Tab(index));
+            }
+            if x >= m.new_tab && x < m.new_tab + m.button {
+                return Some(Hit::NewTab);
+            }
+            return None;
+        }
+        if y < m.top + m.toolbar {
             if x >= m.back && x < m.back + m.button {
                 return Some(Hit::Back);
             }
@@ -288,8 +348,10 @@ impl Chrome {
         let text_h = font::CELL_H * ts;
         let strip = self.status_px();
 
-        fill(buf, width, 0, 0, width, m.toolbar, TOOLBAR_BG);
-        fill(buf, width, 0, m.toolbar - 1, width, m.toolbar, TOOLBAR_LINE);
+        fill(buf, width, 0, 0, width, m.top, TABSTRIP_BG);
+        self.tab_strip(buf, width, height, m, ts);
+        fill(buf, width, 0, m.top, width, m.top + m.toolbar, TOOLBAR_BG);
+        fill(buf, width, 0, m.top + m.toolbar - 1, width, m.top + m.toolbar, TOOLBAR_LINE);
 
         self.button(buf, width, m.back, m, Hit::Back, |buf, width, x, y, s| {
             let mid = y + (m.button as i32) / 2;
@@ -388,17 +450,71 @@ impl Chrome {
         hit: Hit,
         glyph: impl Fn(&mut [u32], u32, i32, i32, f32),
     ) {
-        let y = m.toolbar.saturating_sub(m.button) / 2;
+        let y = m.top + m.toolbar.saturating_sub(m.button) / 2;
         if self.hover == Some(hit) {
             round_rect(buf, width, x, y, m.button, m.button, (6.0 * self.scale) as u32, BUTTON_HOVER);
         }
         glyph(buf, width, x as i32, y as i32, self.scale);
+    }
+
+    /// The tab strip: one chip per tab, then the `+` button.
+    fn tab_strip(&self, buf: &mut [u32], width: u32, height: u32, m: Metrics, ts: u32) {
+        let margin = (8.0 * self.scale).round() as u32;
+        let pad = (7.0 * self.scale).round() as u32;
+        let text_h = font::CELL_H * ts;
+        let radius = (6.0 * self.scale) as u32;
+        let inset = (4.0 * self.scale).round() as u32;
+        let chip_h = m.top.saturating_sub(inset);
+        for (index, tab) in self.tabs.iter().enumerate() {
+            let x = margin + m.tab_w * index as u32;
+            let w = m.tab_w.saturating_sub(2);
+            let bg = if tab.active { TAB_ACTIVE } else { TAB_IDLE };
+            round_rect(buf, width, x, inset, w, chip_h, radius, bg);
+            let text_y = inset + (chip_h.saturating_sub(text_h)) / 2;
+            let close_w = (22.0 * self.scale).round() as u32;
+            let text_w = w.saturating_sub(pad * 2 + close_w);
+            let color = if tab.active { TEXT } else { TEXT_DIM };
+            text(
+                buf,
+                width,
+                height,
+                x + pad,
+                text_y,
+                &tab.title,
+                ts,
+                color,
+                x + pad,
+                x + pad + text_w,
+            );
+            // Close box: a small x, highlighted when hovered.
+            let cx = x + w.saturating_sub(close_w) + close_w / 2;
+            let cy = inset + chip_h / 2;
+            if self.hover == Some(Hit::TabClose(index)) {
+                let r = (7.0 * self.scale).round() as u32;
+                round_rect(buf, width, cx - r, cy - r, r * 2, r * 2, r, BUTTON_HOVER);
+            }
+            let arm = (3.0 * self.scale).round() as i32;
+            line(buf, width, cx as i32 - arm, cy as i32 - arm, cx as i32 + arm, cy as i32 + arm, BUTTON_GLYPH, 2);
+            line(buf, width, cx as i32 - arm, cy as i32 + arm, cx as i32 + arm, cy as i32 - arm, BUTTON_GLYPH, 2);
+        }
+        // `+` for a new tab.
+        let y = inset + chip_h.saturating_sub(m.button) / 2;
+        if self.hover == Some(Hit::NewTab) {
+            round_rect(buf, width, m.new_tab, y, m.button, m.button, radius, BUTTON_HOVER);
+        }
+        let cx = (m.new_tab + m.button / 2) as i32;
+        let cy = (y + m.button / 2) as i32;
+        let arm = (5.0 * self.scale).round() as i32;
+        line(buf, width, cx - arm, cy, cx + arm, cy, BUTTON_GLYPH, 2);
+        line(buf, width, cx, cy - arm, cx, cy + arm, BUTTON_GLYPH, 2);
     }
 }
 
 /// Pixel positions of the chrome's parts, in device pixels.
 #[derive(Debug, Clone, Copy)]
 struct Metrics {
+    /// Tab strip height; the toolbar starts below it.
+    top: u32,
     toolbar: u32,
     button: u32,
     field_x: u32,
@@ -408,6 +524,9 @@ struct Metrics {
     back: u32,
     forward: u32,
     reload: u32,
+    /// Width of one tab, and the x of the `+` button.
+    tab_w: u32,
+    new_tab: u32,
 }
 
 fn fill(buf: &mut [u32], width: u32, x0: u32, y0: u32, x1: u32, y1: u32, color: u32) {
@@ -591,13 +710,40 @@ mod tests {
     fn hit_test_maps_the_toolbar() {
         let chrome = chrome();
         let width = 1000;
-        assert_eq!(chrome.hit(10.0, 20.0, width), Some(Hit::Back));
-        assert_eq!(chrome.hit(44.0, 20.0, width), Some(Hit::Forward));
-        assert_eq!(chrome.hit(78.0, 20.0, width), Some(Hit::Reload));
-        assert_eq!(chrome.hit(400.0, 20.0, width), Some(Hit::Url));
+        assert_eq!(chrome.hit(10.0, 52.0, width), Some(Hit::Back));
+        assert_eq!(chrome.hit(44.0, 52.0, width), Some(Hit::Forward));
+        assert_eq!(chrome.hit(78.0, 52.0, width), Some(Hit::Reload));
+        assert_eq!(chrome.hit(400.0, 52.0, width), Some(Hit::Url));
         assert_eq!(chrome.hit(400.0, 200.0, width), None);
         assert!(chrome.over_status(630.0, 640));
         assert!(!chrome.over_status(200.0, 640));
+    }
+
+    #[test]
+    fn hit_test_maps_the_tab_strip() {
+        let mut chrome = chrome();
+        chrome.tabs = vec![
+            TabChip { title: "One".into(), active: true },
+            TabChip { title: "Two".into(), active: false },
+        ];
+        let width = 1000;
+        assert_eq!(chrome.hit(20.0, 10.0, width), Some(Hit::Tab(0)));
+        assert_eq!(chrome.hit(240.0, 10.0, width), Some(Hit::Tab(1)));
+        // The close box sits at the right edge of each chip; a single tab is
+        // capped at 220 logical pixels.
+        let tab_w = 220;
+        assert_eq!(
+            chrome.hit((8 + tab_w - 5) as f64, 10.0, width),
+            Some(Hit::TabClose(0))
+        );
+        assert_eq!(chrome.hit(4.0, 10.0, width), None);
+    }
+
+    #[test]
+    fn tab_strip_grows_the_chrome() {
+        let chrome = Chrome::new(1.0);
+        assert_eq!(chrome.tabstrip_px(), 32);
+        assert_eq!(chrome.chrome_px(), 72);
     }
 
     #[test]
@@ -654,6 +800,10 @@ mod tests {
         let mut chrome = chrome();
         chrome.status = "Cinder 0.1.0-pre.6 is available".to_string();
         chrome.hover = Some(Hit::Back);
+        chrome.tabs = vec![
+            TabChip { title: "Cinder".into(), active: true },
+            TabChip { title: "Example".into(), active: false },
+        ];
         chrome.begin_edit();
         let (width, height) = (320u32, 200u32);
         let mut buffer = vec![0u32; (width * height) as usize];

@@ -681,7 +681,71 @@ fn run_open(target: Option<&str>) -> i32 {    use std::cell::RefCell;
         title: "Cinder".to_string(),
         ..Default::default()
     };
-    let result = cinder_window::run_on(
+    // The tab strip talks to the same orchestrator; each closure borrows it
+    // only for the duration of the call, so the window loop stays single
+    // threaded and lock free.
+    let tabs_open = Rc::clone(&shared);
+    let tabs_activate = Rc::clone(&shared);
+    let tabs_close = Rc::clone(&shared);
+    let tabs_list = Rc::clone(&shared);
+    let tabs = cinder_window::TabHost {
+        open: Box::new(move |parent| {
+            use cinder_adapter::command::Surface;
+            let mut browser = tabs_open.borrow_mut();
+            browser.set_surface(Surface::NativeChild {
+                parent: parent.handle,
+                top: parent.top,
+                width: parent.width,
+                height: parent.height,
+                scale: parent.scale,
+            });
+            let window = browser
+                .active_window()
+                .unwrap_or_else(|| browser.open_window());
+            match browser.open_tab(window, None) {
+                Ok(tab) => browser.tab(tab).map(|t| (t.id.get(), t.view)),
+                Err(e) => {
+                    eprintln!("could not open tab: {e}");
+                    None
+                }
+            }
+        }),
+        activate: Box::new(move |key| {
+            let mut browser = tabs_activate.borrow_mut();
+            let window = browser.active_window()?;
+            let tab = browser.tabs().find(|t| t.id.get() == key).map(|t| t.id)?;
+            browser.window_mut(window)?.activate(tab);
+            browser.tab(tab).map(|t| t.view)
+        }),
+        close: Box::new(move |key| {
+            let mut browser = tabs_close.borrow_mut();
+            let tab = browser.tabs().find(|t| t.id.get() == key).map(|t| t.id);
+            if let Some(tab) = tab {
+                let _ = browser.close_tab(tab);
+            }
+        }),
+        list: Box::new(move || {
+            let browser = tabs_list.borrow();
+            let Some(window) = browser.active_window().and_then(|id| browser.window(id)) else {
+                return Vec::new();
+            };
+            window
+                .tabs
+                .iter()
+                .filter_map(|id| browser.tab(*id))
+                .map(|tab| {
+                    (
+                        tab.id.get(),
+                        cinder_window::TabChip {
+                            title: truncate(&tab.display_title(), 28),
+                            active: window.active == Some(tab.id),
+                        },
+                    )
+                })
+                .collect()
+        }),
+    };
+    let result = cinder_window::run_on_with_tabs(
         event_loop,
         engine.clone(),
         options,
@@ -704,7 +768,7 @@ fn run_open(target: Option<&str>) -> i32 {    use std::cell::RefCell;
                 Ok(tab) => {
                     println!("web engine : CEF {}", cinder_adapter_cef::Cef::version());
                     println!("tab        : {tab} -> {}", url.as_str());
-                    browser.tab(tab).map(|t| t.view)
+                    browser.tab(tab).map(|t| (t.id.get(), t.view))
                 }
                 Err(e) => {
                     eprintln!("could not open tab: {e}");
@@ -783,6 +847,7 @@ fn run_open(target: Option<&str>) -> i32 {    use std::cell::RefCell;
             }
         }
         },
+        tabs,
     );
 
     let mut browser = shared.borrow_mut();
