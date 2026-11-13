@@ -183,14 +183,36 @@ jobs:
           & "$wix\light.exe" -sval -out $msi obj\*.wixobj
           if ($LASTEXITCODE -ne 0) { throw "light failed" }
 
-          # Prove the MSI really carries the browser: an administrative install
-          # unpacks every file without touching Program Files.
+          # Prove the MSI really carries the browser. First a cheap structural
+          # check: dark decompiles the package and extracts its payload, so a
+          # missing cinder.exe fails here with a clear message instead of
+          # surfacing as a mysterious msiexec exit code.
+          $dark = Join-Path $PWD 'msi-dark'
+          & "$wix\dark.exe" -nologo -x $dark $msi | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "dark failed on $msi" }
+          if (-not (Get-ChildItem $dark -Recurse -Filter cinder.exe -ErrorAction SilentlyContinue)) {
+            throw "MSI payload has no cinder.exe"
+          }
+
+          # Then the real thing: an administrative install unpacks every file
+          # without touching Program Files.
           $admin = Join-Path $PWD 'msi-check'
-          Start-Process msiexec.exe -Wait -ArgumentList @(
-            '/a', "`"$(Resolve-Path $msi).Path`"", '/qn', "TARGETDIR=`"$admin`"")
+          $msiLog = Join-Path $PWD 'msi-admin.log'
+          $msiPath = (Resolve-Path $msi).Path
+          $p = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @(
+            '/a', "`"$msiPath`"", '/qn', "/l*v `"$msiLog`"", "TARGETDIR=`"$admin`"")
+          if ($p.ExitCode -ne 0) {
+            Write-Host "msiexec /a exited $($p.ExitCode); log tail:"
+            if (Test-Path $msiLog) { Get-Content $msiLog -Tail 40 }
+            throw "administrative install of $msi failed with $($p.ExitCode)"
+          }
           $found = Get-ChildItem $admin -Recurse -Filter cinder.exe -ErrorAction SilentlyContinue |
             Select-Object -First 1
-          if (-not $found) { throw "administrative install of $msi produced no cinder.exe" }
+          if (-not $found) {
+            Write-Host "administrative install produced no cinder.exe; tree:"
+            if (Test-Path $admin) { Get-ChildItem $admin -Recurse | Select-Object -First 40 FullName }
+            throw "administrative install of $msi produced no cinder.exe"
+          }
 
           $iscc = 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
           if (-not (Test-Path $iscc)) { throw "Inno Setup not found at $iscc" }
@@ -205,8 +227,9 @@ jobs:
           # check the binary landed, then uninstall.
           $setup = (Resolve-Path "dist\cinder-$version-x86_64-pc-windows-msvc-setup.exe").Path
           $inst = Join-Path $PWD 'exe-check'
-          Start-Process $setup -Wait -ArgumentList `
+          $p = Start-Process $setup -Wait -PassThru -ArgumentList `
             "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /DIR=`"$inst`""
+          if ($p.ExitCode -ne 0) { throw "setup.exe exited $($p.ExitCode)" }
           if (-not (Test-Path (Join-Path $inst 'cinder.exe'))) {
             throw "silent install of $setup produced no cinder.exe"
           }
