@@ -66,6 +66,9 @@ fn main() {
                 release_dir.display()
             );
             println!("cargo:rustc-link-lib=framework=Chromium Embedded Framework");
+            // The shim drives CEF from a CFRunLoopTimer, which lives in
+            // CoreFoundation.
+            println!("cargo:rustc-link-lib=framework=CoreFoundation");
             // The shim resizes the browser view with objc_msgSend.
             println!("cargo:rustc-link-lib=dylib=objc");
         }

@@ -543,6 +543,9 @@ fn window_args() -> Vec<String> {
     let mut args: Vec<String> = Vec::new();
     // No GPU on CI runners.
     args.push("--disable-gpu".into());
+    // Chromium resolves its UI locale from this switch before CEF's settings
+    // are converted, so pass it explicitly as well as in cef_settings_t.
+    args.push("--lang=en-US".into());
     // Chromium writes CHECK failures to its log, not to stderr, on Windows.
     #[cfg(target_os = "windows")]
     args.push("--enable-logging=stderr".into());

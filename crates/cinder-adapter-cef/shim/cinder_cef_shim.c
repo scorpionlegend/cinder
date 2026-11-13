@@ -1020,6 +1020,18 @@ int cinder_cef_init_ex(int argc, char** argv, const char* resources_dir,
         (long)settings.resources_dir_path.length);
   trace("settings paths", (long)settings.locales_dir_path.length,
         (long)settings.log_file.length);
+  /* Chromium CHECKs inside InitResourceBundleAndDetermineLocale when the pak
+   * for the resolved locale is missing, so report whether it is there. */
+  if (locales_dir) {
+    char pak[1024];
+    FILE* probe;
+    snprintf(pak, sizeof(pak), "%s/en-US.pak", locales_dir);
+    probe = fopen(pak, "rb");
+    trace("locale pak", probe ? 1 : 0, 0);
+    if (probe) {
+      fclose(probe);
+    }
+  }
   install_crash_diagnostics();
   if (!cef_initialize(&args, &settings, &g_app, NULL)) {
     set_error("cef_initialize failed");
