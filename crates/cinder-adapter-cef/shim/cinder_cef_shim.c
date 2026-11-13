@@ -942,6 +942,10 @@ int cinder_cef_init_ex(int argc, char** argv, const char* resources_dir,
   settings.external_message_pump = external_pump ? 1 : 0;
   settings.log_severity = LOGSEVERITY_WARNING;
   settings.background_color = 0xFFFFFFFFu;
+  /* The C API copies this struct field by field, so an empty locale overrides
+   * the "en-US" default the C++ wrapper would have applied. Chromium then
+   * looks for "<locales>/<empty>.pak", fails, and CHECKs during startup. */
+  cef_string_from_utf8("en-US", 5, &settings.locale);
   if (resources_dir) {
     cef_string_from_utf8(resources_dir, strlen(resources_dir),
                          &settings.resources_dir_path);

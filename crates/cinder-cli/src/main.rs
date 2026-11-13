@@ -586,6 +586,17 @@ fn run_open(target: Option<&str>) -> i32 {
     if std::env::var_os("CINDER_WINDOW_SELFTEST").is_some() {
         eprintln!("window trace: engine starting");
     }
+    // The loop must exist before CEF initializes: on macOS AppKit delivers
+    // `applicationDidFinishLaunching` — the callback winit turns into
+    // `resumed` — only to the delegate installed beforehand, and CEF touches
+    // NSApplication while it starts.
+    let event_loop = match cinder_window::event_loop() {
+        Ok(loop_) => loop_,
+        Err(e) => {
+            eprintln!("could not build the event loop: {e}");
+            return 1;
+        }
+    };
     let engine = match CefEngine::new(config) {
         Ok(e) => Arc::new(e),
         Err(e) => {
@@ -647,7 +658,8 @@ fn run_open(target: Option<&str>) -> i32 {
         title: "Cinder".to_string(),
         ..Default::default()
     };
-    let result = cinder_window::run(
+    let result = cinder_window::run_on(
+        event_loop,
         engine.clone(),
         options,
         ui,

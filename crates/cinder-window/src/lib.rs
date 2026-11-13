@@ -120,6 +120,27 @@ pub struct NativeParent {
     pub scale: f32,
 }
 
+/// Build the shell's event loop.
+///
+/// macOS delivers `resumed` from `applicationDidFinishLaunching`, which AppKit
+/// only sends to the delegate installed before the app starts running. CEF
+/// touches `NSApplication` while it initializes, so the loop has to exist
+/// first: otherwise the delegate is installed after the callback already
+/// happened and the shell waits forever for a `resumed` that never comes.
+pub fn event_loop() -> Result<EventLoop<()>, WindowError> {
+    let mut builder = EventLoop::builder();
+    // CEF embeds an X11 child window, so the shell must be an X11 window even
+    // when the session is Wayland; XWayland provides the display.
+    #[cfg(target_os = "linux")]
+    builder.with_x11();
+    trace("event loop building");
+    let event_loop = builder
+        .build()
+        .map_err(|e| WindowError::EventLoop(e.to_string()))?;
+    trace("event loop built");
+    Ok(event_loop)
+}
+
 /// Run the window until the user closes it.
 ///
 /// `open` is called once the window exists, with the handle the engine needs to
@@ -132,16 +153,19 @@ pub fn run(
     open: impl FnOnce(NativeParent) -> Option<ViewId> + 'static,
     tick: impl FnMut() + 'static,
 ) -> Result<(), WindowError> {
-    let mut builder = EventLoop::builder();
-    // CEF embeds an X11 child window, so the shell must be an X11 window even
-    // when the session is Wayland; XWayland provides the display.
-    #[cfg(target_os = "linux")]
-    builder.with_x11();
-    trace("event loop building");
-    let event_loop = builder
-        .build()
-        .map_err(|e| WindowError::EventLoop(e.to_string()))?;
-    trace("event loop built");
+    let event_loop = event_loop()?;
+    run_on(event_loop, engine, options, ui, open, tick)
+}
+
+/// Run the window on an event loop the caller already built.
+pub fn run_on(
+    event_loop: EventLoop<()>,
+    engine: Arc<CefEngine>,
+    options: WindowOptions,
+    ui: Ui,
+    open: impl FnOnce(NativeParent) -> Option<ViewId> + 'static,
+    tick: impl FnMut() + 'static,
+) -> Result<(), WindowError> {
     event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + TICK));
     let mut app = Shell {
         engine,
