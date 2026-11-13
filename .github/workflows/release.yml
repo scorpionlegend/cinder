@@ -158,7 +158,6 @@ jobs:
       # Windows once that crash is fixed.
       - name: Window selftest
         if: contains(matrix.target, 'windows') || contains(matrix.target, 'darwin')
-        continue-on-error: ${{ contains(matrix.target, 'windows') }}
         timeout-minutes: 20
         shell: bash
         run: |
@@ -192,22 +191,9 @@ jobs:
             echo "=== cef log ==="
             tail -80 "$RUNNER_TEMP/cef-debug.log"
           fi
-          # Windows: a second run with the pump on a hidden timer window. If the
-          # first run stalls inside the host's callback and this one presents,
-          # the difference names the fault.
-          if [[ "${{ matrix.target }}" == *windows* ]]; then
-            bounded 60 "$RUNNER_TEMP/selftest-timer.out" env \
-              CINDER_CEF_LOG="$RUNNER_TEMP/cef-debug-timer.log" \
-              CINDER_NO_UPDATE_CHECK=1 CINDER_WINDOW_SELFTEST=8 \
-              CINDER_CEF_PUMP_TIMER=1 \
-              $bin about:blank && tcode=0 || tcode=$?
-            tout=$(cat "$RUNNER_TEMP/selftest-timer.out")
-            echo "$tout"
-            echo "timer exit code: $tcode"
-            printf -v out '%s\n%s' "$out" "$tout"
-          fi
           if ! grep -q "window selftest: .*view=view-" <<<"$out"; then
-            echo "::warning::the window never got a page view (exit $code)"
+            echo "::error::the window never got a page view (exit $code)"
+            exit 1
           fi
           # Each probe initializes CEF one way and exits; the exit code says
           # whether that variant survived. Together they separate a thread

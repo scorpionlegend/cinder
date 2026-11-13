@@ -88,8 +88,9 @@ static int g_upgrade_https = 0;
  * only valid when the host owns the loop. */
 static int g_external_pump = 1;
 /* Non-zero once a hidden window's WM_TIMER drives the pump; the host then
- * leaves cinder_cef_pump alone. */
-static int g_pump_timer = 0;
+ * leaves cinder_cef_pump alone. Named apart from the macOS CFRunLoopTimer
+ * below, which owns the pump on that platform. */
+static int g_pump_timer_owned = 0;
 
 /* Guards the policy copy and the browser→view lookup, both of which are read
  * from CEF's IO thread while the engine thread mutates them.
@@ -1438,7 +1439,7 @@ void cinder_cef_pump(int ms) {
     return;
   }
   /* A timer window owns the pump in this mode. */
-  if (g_pump_timer) {
+  if (g_pump_timer_owned) {
     return;
   }
   trace("pump enter", ms, 0);
@@ -1480,7 +1481,7 @@ int cinder_cef_start_pump_timer(int interval_ms) {
   HWND hwnd;
   UINT_PTR id;
 
-  if (g_pump_timer) {
+  if (g_pump_timer_owned) {
     return 1;
   }
   memset(&wc, 0, sizeof(wc));
@@ -1503,7 +1504,7 @@ int cinder_cef_start_pump_timer(int interval_ms) {
     trace("pump timer failed", (long)GetLastError(), 0);
     return 0;
   }
-  g_pump_timer = 1;
+  g_pump_timer_owned = 1;
   trace("pump timer installed", interval_ms, (long)id);
   return 1;
 }

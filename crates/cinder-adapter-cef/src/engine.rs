@@ -269,10 +269,15 @@ pub fn default_pump_in_send() -> bool {
 
 /// Whether a hidden timer window drives the pump. `CINDER_CEF_PUMP_TIMER=0|1`
 /// overrides it; the shim only has such a window on Windows.
+///
+/// Windows defaults to it: pumping from inside winit's event callback runs a
+/// nested Win32 message loop that never returns, so the window selftest stalls
+/// at its first tick. A `WM_TIMER` on a message-only window is dispatched by
+/// whichever loop is running and needs no re-entry.
 pub fn default_pump_timer() -> bool {
     match std::env::var("CINDER_CEF_PUMP_TIMER") {
         Ok(value) => value != "0",
-        Err(_) => false,
+        Err(_) => cfg!(target_os = "windows"),
     }
 }
 
