@@ -17,12 +17,27 @@ use std::path::{Path, PathBuf};
 /// failure to stage the runtime cannot turn into an infinite exec loop.
 const STAGED_ENV: &str = "CINDER_CEF_STAGED";
 
-/// Where `CINDER_CEF_ROOT` points, defaulting to `~/cef`.
+/// Where the CEF runtime lives.
+///
+/// `CINDER_CEF_ROOT` wins. Otherwise an installed bundle is used, which keeps
+/// the runtime next to the executable; only a checkout falls back to `~/cef`.
+/// `HOME` is unset on Windows, so the bundle check has to come first there.
 pub fn root() -> PathBuf {
-    PathBuf::from(
-        std::env::var("CINDER_CEF_ROOT")
-            .unwrap_or_else(|_| format!("{}/cef", std::env::var("HOME").unwrap_or_default())),
-    )
+    if let Ok(explicit) = std::env::var("CINDER_CEF_ROOT") {
+        return PathBuf::from(explicit);
+    }
+    if let Some(dir) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf))
+    {
+        if dir.join("icudtl.dat").exists() {
+            return dir;
+        }
+    }
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_default();
+    PathBuf::from(home).join("cef")
 }
 
 /// Merge the CEF runtime under `root` into `dest`, returning `dest`.
@@ -35,38 +50,73 @@ pub fn root() -> PathBuf {
 /// a file descriptor and rejects a symlink there. The result is cached behind a
 /// `.ready` marker so repeated calls in one process are cheap.
 pub fn stage(root: &Path, dest: &Path) -> PathBuf {
-    if dest.join(".ready").exists() {
+    // The marker records which root produced the copy: a different root must
+    // not silently reuse the previous one's files.
+    let marker = dest.join(".ready");
+    if std::fs::read_to_string(&marker).ok().as_deref() == Some(&root.to_string_lossy()) {
         return dest.to_path_buf();
     }
     let _ = std::fs::remove_dir_all(dest);
     let _ = std::fs::create_dir_all(dest);
     let mut nested = false;
+    let mut failed = 0usize;
     for sub in ["Resources", "Release"] {
         let Ok(entries) = std::fs::read_dir(root.join(sub)) else {
             continue;
         };
         nested = true;
-        copy_entries(entries, dest);
+        failed += copy_entries(entries, dest);
     }
     if !nested {
         if let Ok(entries) = std::fs::read_dir(root) {
-            copy_entries(entries, dest);
+            failed += copy_entries(entries, dest);
         }
     }
-    let _ = std::fs::write(dest.join(".ready"), b"1");
+    if failed > 0 {
+        eprintln!(
+            "cinder: {failed} runtime files could not be staged into {}",
+            dest.display()
+        );
+    }
+    // A half-copied runtime fails later as a confusing Chromium error, so only
+    // mark the copy usable when the files Chromium needs are actually there.
+    if failed == 0 && staged_ok(dest) {
+        let _ = std::fs::write(&marker, root.to_string_lossy().as_bytes());
+    } else {
+        let _ = std::fs::remove_file(&marker);
+    }
     dest.to_path_buf()
 }
 
-fn copy_entries(entries: std::fs::ReadDir, dest: &Path) {
+/// Whether a staged directory holds the files Chromium refuses to start
+/// without: the ICU data and the CEF library itself.
+fn staged_ok(dest: &Path) -> bool {
+    let non_empty = |path: PathBuf| {
+        std::fs::metadata(path)
+            .map(|meta| meta.len() > 0)
+            .unwrap_or(false)
+    };
+    let library = ["libcef.so", "libcef.dll", "Chromium Embedded Framework"]
+        .iter()
+        .any(|name| non_empty(dest.join(name)));
+    non_empty(dest.join("icudtl.dat")) && library
+}
+
+fn copy_entries(entries: std::fs::ReadDir, dest: &Path) -> usize {
+    let mut failed = 0;
     for entry in entries.flatten() {
         let target = dest.join(entry.file_name());
         let source = entry.path();
-        if source.is_dir() {
-            let _ = copy_dir(&source, &target);
+        let result = if source.is_dir() {
+            copy_dir(&source, &target)
         } else {
-            let _ = std::fs::copy(&source, &target);
+            std::fs::copy(&source, &target).map(|_| ())
+        };
+        if result.is_err() {
+            failed += 1;
         }
     }
+    failed
 }
 
 fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
@@ -120,6 +170,17 @@ pub fn ensure_loaded(runtime: &Path) {
 pub fn prepare(root: &Path) -> PathBuf {
     let dest = std::env::temp_dir().join("cinder-cef-runtime");
     let staged = stage(root, &dest);
+    if std::env::var_os("CINDER_WINDOW_SELFTEST").is_some() {
+        let paks = std::fs::read_dir(staged.join("locales"))
+            .map(|dir| dir.count())
+            .unwrap_or(0);
+        eprintln!(
+            "window trace: runtime staged from {} icu={} locales={}",
+            root.display(),
+            staged.join("icudtl.dat").exists(),
+            paks
+        );
+    }
     ensure_loaded(&staged);
     staged
 }
