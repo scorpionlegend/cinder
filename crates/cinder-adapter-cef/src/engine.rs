@@ -143,6 +143,13 @@ pub struct CefEngineConfig {
     /// an "Unknown Thread" and trips a `CHECK` inside the first pump. Linux has
     /// no such binding, so it keeps the dedicated thread.
     pub main_thread: bool,
+    /// Whether the host pumps CEF with `CefDoMessageLoopWork`.
+    ///
+    /// A host that already runs an event loop on the initializing thread asks
+    /// for this. macOS is the exception: pumping there spins AppKit's run loop,
+    /// which re-enters the host's event handler, so CEF drives itself from the
+    /// run loop instead and [`Engine::pump`] does nothing.
+    pub external_pump: bool,
     /// What this build actually provides. Defaults to [`measured_capabilities`].
     pub capabilities: Capabilities,
 }
@@ -161,6 +168,7 @@ impl CefEngineConfig {
             extra_args: Vec::new(),
             windowless: true,
             main_thread: default_main_thread(),
+            external_pump: default_external_pump(),
             capabilities: measured_capabilities(),
         }
     }
@@ -174,6 +182,15 @@ pub fn default_main_thread() -> bool {
     match std::env::var("CINDER_CEF_MAIN_THREAD") {
         Ok(value) => value != "0",
         Err(_) => !cfg!(target_os = "linux"),
+    }
+}
+
+/// Whether the host has to pump CEF itself. `CINDER_CEF_EXTERNAL_PUMP=0|1`
+/// overrides it so either mode can be exercised on any platform.
+pub fn default_external_pump() -> bool {
+    match std::env::var("CINDER_CEF_EXTERNAL_PUMP") {
+        Ok(value) => value != "0",
+        Err(_) => !cfg!(target_os = "macos"),
     }
 }
 
@@ -461,10 +478,6 @@ pub struct CefEngine {
     core: Mutex<Option<EngineCore>>,
     capabilities: Capabilities,
     closed: AtomicBool,
-    /// Whether `send` pumps before serving. macOS turns this off because the
-    /// pump spins AppKit's run loop, which must not happen inside a winit
-    /// callback; the window layer pumps from the main queue instead.
-    pump_in_send: AtomicBool,
     join: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -492,7 +505,6 @@ impl CefEngine {
                 core: Mutex::new(Some(core)),
                 capabilities,
                 closed: AtomicBool::new(false),
-                pump_in_send: AtomicBool::new(true),
                 join: Mutex::new(None),
             });
         }
@@ -511,7 +523,6 @@ impl CefEngine {
                 core: Mutex::new(None),
                 capabilities,
                 closed: AtomicBool::new(false),
-                pump_in_send: AtomicBool::new(true),
                 join: Mutex::new(Some(join)),
             }),
             Ok(Err(message)) => {
@@ -530,9 +541,7 @@ impl CefEngine {
         };
         let mut guard = self.core.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(core) = guard.as_mut() {
-            if self.pump_in_send.load(Ordering::Relaxed) {
-                core.pump();
-            }
+            core.pump();
             let alive = core.serve(request);
             let result = ack_rx.recv_timeout(ACCEPT_TIMEOUT).unwrap_or_else(|_| {
                 Err(AdapterError::EngineFault(
@@ -571,9 +580,7 @@ impl CefEngine {
         let request = make(ack_tx);
         let mut guard = self.core.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(core) = guard.as_mut() {
-            if self.pump_in_send.load(Ordering::Relaxed) {
-                core.pump();
-            }
+            core.pump();
             core.serve(request);
             return ack_rx.recv_timeout(timeout).ok();
         }
@@ -582,12 +589,6 @@ impl CefEngine {
         tx.as_ref()?.send(request).ok()?;
         drop(tx);
         ack_rx.recv_timeout(timeout).ok()
-    }
-
-    /// Whether `send` pumps CEF before serving a command. Turning this off
-    /// leaves pumping to the caller, which is what macOS needs.
-    pub fn set_pump_in_send(&self, on: bool) {
-        self.pump_in_send.store(on, Ordering::Relaxed);
     }
 
     /// Advance CEF by one slice when the engine runs inline. A no-op when the
@@ -705,6 +706,9 @@ struct EngineCore {
     sink_ptr: *mut c_void,
     ids: IdAllocator,
     state: EngineState,
+    /// Whether this core has to pump CEF itself; see
+    /// [`CefEngineConfig::external_pump`].
+    external_pump: bool,
 }
 
 // SAFETY: a core is only ever touched by the thread that initialized CEF —
@@ -719,7 +723,7 @@ impl EngineCore {
             &config.cache_dir,
             &config.extra_args,
             config.windowless,
-            config.main_thread,
+            config.external_pump,
         )?;
 
         let sink = Arc::new(EventSink::new(event_tx));
@@ -741,11 +745,14 @@ impl EngineCore {
             sink_ptr,
             ids: IdAllocator::new(),
             state: EngineState::default(),
+            external_pump: config.external_pump,
         })
     }
 
     fn pump(&mut self) {
-        self.cef.pump(PUMP_MS);
+        if self.external_pump {
+            self.cef.pump(PUMP_MS);
+        }
         reconcile(&mut self.state, &self.sink);
     }
 

@@ -101,6 +101,7 @@ fn run_probe(name: &str) -> i32 {
         extra_args: window_args(),
         windowless: false,
         main_thread: cinder_adapter_cef::default_main_thread(),
+        external_pump: cinder_adapter_cef::default_external_pump(),
         capabilities: cinder_adapter_cef::measured_capabilities(),
     };
     match name {
@@ -437,6 +438,7 @@ fn run_browse(target: Option<&str>) -> i32 {
         ],
         windowless: true,
         main_thread: cinder_adapter_cef::default_main_thread(),
+        external_pump: cinder_adapter_cef::default_external_pump(),
         capabilities: cinder_adapter_cef::measured_capabilities(),
     };
     println!("web engine : CEF {}", cinder_adapter_cef::Cef::version());
@@ -580,6 +582,7 @@ fn run_open(target: Option<&str>) -> i32 {
         extra_args: window_args(),
         windowless: false,
         main_thread: cinder_adapter_cef::default_main_thread(),
+        external_pump: cinder_adapter_cef::default_external_pump(),
         capabilities: cinder_adapter_cef::measured_capabilities(),
     };
 

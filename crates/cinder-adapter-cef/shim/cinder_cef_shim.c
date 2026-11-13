@@ -80,6 +80,9 @@ static void* g_event_user = NULL;
 static char g_blocked_hosts[CINDER_CEF_MAX_BLOCKED_HOSTS][256];
 static int g_blocked_count = 0;
 static int g_upgrade_https = 0;
+/* Set from cef_settings_t.external_message_pump: cef_do_message_loop_work is
+ * only valid when the host owns the loop. */
+static int g_external_pump = 1;
 
 /* Guards the policy copy and the browser→view lookup, both of which are read
  * from CEF's IO thread while the engine thread mutates them.
@@ -940,6 +943,7 @@ int cinder_cef_init_ex(int argc, char** argv, const char* resources_dir,
    * Without this, CEF expects cef_run_message_loop() and the pump is a no-op
    * on some platforms. */
   settings.external_message_pump = external_pump ? 1 : 0;
+  g_external_pump = external_pump ? 1 : 0;
   settings.log_severity = LOGSEVERITY_WARNING;
   settings.background_color = 0xFFFFFFFFu;
   /* The C API copies this struct field by field, so an empty locale overrides
@@ -1367,6 +1371,11 @@ int cinder_cef_set_policy(const char* const* blocked_hosts, int count,
 
 void cinder_cef_pump(int ms) {
   int elapsed = 0;
+  /* Only defined when the host owns the loop; calling it otherwise is a
+   * CHECK in Chromium. */
+  if (!g_external_pump) {
+    return;
+  }
   while (elapsed < ms) {
     cef_do_message_loop_work();
     sleep_ms(1);
