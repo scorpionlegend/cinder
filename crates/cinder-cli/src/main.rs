@@ -26,6 +26,8 @@ fn main() {
     let code = match command {
         "demo" => run_demo(),
         "browse" => run_browse(args.get(1).map(String::as_str)),
+        "open" => run_open(args.get(1).map(String::as_str)),
+        other if looks_like_url(other) => run_open(Some(other)),
         "version" | "--version" | "-V" => {
             println!("cinder {} (adapter api 0.1)", env!("CARGO_PKG_VERSION"));
             0
@@ -51,16 +53,25 @@ fn print_help() {
     println!("cinder {} — Cinder shell (mock engine)", env!("CARGO_PKG_VERSION"));
     println!();
     println!("USAGE:");
+    println!("  cinder <url>     open the browser window on a page");
+    println!("  cinder open <url>  same as above");
     println!("  cinder demo      run a scripted session: tabs, policy, decisions, restore, shutdown");
-    println!("  cinder browse <url>  load a real page in the CEF web engine");
+    println!("  cinder browse <url>  load a real page headlessly and report the result");
     println!("  cinder version   print the version");
     println!("  cinder help      this text");
     println!();
-    if cfg!(feature = "cef") {
-        println!("This build links the CEF web engine; `browse` drives it.");
+    if cfg!(feature = "window") {
+        println!("This build opens a window; `browse` stays headless.");
+    } else if cfg!(feature = "cef") {
+        println!("This build links the CEF web engine but has no window layer.");
     } else {
         println!("This build has no web engine: `browse` needs --features cef.");
     }
+}
+
+/// A bare argument that names a page rather than a subcommand.
+fn looks_like_url(arg: &str) -> bool {
+    arg.contains("://") || arg.starts_with("www.") || arg.contains('.')
 }
 
 fn run_demo() -> i32 {
@@ -366,6 +377,142 @@ fn run_browse(target: Option<&str>) -> i32 {
 #[cfg(not(feature = "cef"))]
 fn run_browse(_target: Option<&str>) -> i32 {
     eprintln!("this build has no web engine; rebuild with --features cef");
+    2
+}
+
+#[cfg(feature = "window")]
+fn run_open(target: Option<&str>) -> i32 {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use cinder_adapter_cef::{CefEngine, CefEngineConfig};
+
+    let target = target.unwrap_or("about:blank");
+    let url = match Url::parse(target) {
+        Ok(u) => u,
+        Err(e) => {
+            eprintln!("invalid url {target}: {e}");
+            return 2;
+        }
+    };
+
+    let staged = cinder_adapter_cef::prepare_runtime(&cinder_adapter_cef::cef_root());
+    let config = CefEngineConfig {
+        resources_dir: staged.clone(),
+        locales_dir: staged.join("locales"),
+        cache_dir: std::env::temp_dir().join("cinder-window-cache"),
+        // Windowless rendering needs software compositing to produce OnPaint
+        // frames; the GPU path paints into a surface nobody can read. CEF's own
+        // display connection stays headless — the visible window belongs to
+        // winit, not to Chromium.
+        extra_args: vec![
+            "--disable-gpu".into(),
+            "--disable-gpu-compositing".into(),
+            "--disable-software-rasterizer".into(),
+            "--disable-dev-shm-usage".into(),
+        ],
+        capabilities: cinder_adapter_cef::measured_capabilities(),
+    };
+
+    let engine = match CefEngine::new(config) {
+        Ok(e) => Arc::new(e),
+        Err(e) => {
+            eprintln!("engine did not start: {e}");
+            return 1;
+        }
+    };
+
+    let policy = Arc::new(PolicySnapshot::new(1).with_https_upgrade(true));
+    let mut browser = match Browser::new(engine.clone(), policy, "/tmp/cinder-window-profile") {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("failed to start orchestrator: {e}");
+            return 1;
+        }
+    };
+
+    let window = browser.open_window();
+    let tab = match browser.open_tab(window, Some(url.clone())) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("could not open tab: {e}");
+            return 1;
+        }
+    };
+    println!("web engine : CEF {}", cinder_adapter_cef::Cef::version());
+    println!("tab        : {tab} -> {}", url.as_str());
+
+    let Some(view) = browser.tab(tab).map(|t| t.view) else {
+        eprintln!("tab {tab} has no view");
+        return 1;
+    };
+
+    // The window loop owns the main thread and the orchestrator stays on it, so
+    // a plain `Rc<RefCell<_>>` is enough; no locking is needed.
+    let shared = Rc::new(RefCell::new(browser));
+    let pump = Rc::clone(&shared);
+    let probe = Arc::clone(&engine);
+    let debug = std::env::var_os("CINDER_WINDOW_SELFTEST").is_some();
+    let mut ticks = 0u32;
+    let options = cinder_window::WindowOptions {
+        title: "Cinder".to_string(),
+        ..Default::default()
+    };
+    let result = cinder_window::run(engine.clone(), view, options, move || {
+        let mut browser = pump.borrow_mut();
+        for effect in browser.pump() {
+            match effect {
+                Effect::TitleChanged { title, .. } => println!("  title -> {title}"),
+                Effect::LoadFinished { .. } => println!("  load finished"),
+                Effect::LoadFailed { reason, .. } => println!("  load failed ({reason:?})"),
+                Effect::EngineFault { message } => eprintln!("  engine fault: {message}"),
+                other => {
+                    if debug {
+                        println!("  {}", describe(&other));
+                    }
+                }
+            }
+        }
+        ticks += 1;
+        if debug && ticks % 60 == 0 {
+            let frame = probe.copy_frame(view);
+            println!(
+                "  tick {ticks}: frame={:?}",
+                frame.map(|f| (f.width, f.height))
+            );
+        }
+    });
+
+    let mut browser = shared.borrow_mut();
+    let shutdown = browser.shutdown(Duration::from_secs(5));
+    match (result, shutdown) {
+        (Err(e), _) => {
+            eprintln!("window failed: {e}");
+            1
+        }
+        (Ok(()), Ok(report)) => {
+            println!(
+                "shutdown   : forced={} remaining={} complete={}",
+                report.forced_closed, report.remaining, report.shutdown_complete
+            );
+            0
+        }
+        (Ok(()), Err(e)) => {
+            eprintln!("shutdown failed: {e}");
+            1
+        }
+    }
+}
+
+#[cfg(all(feature = "cef", not(feature = "window")))]
+fn run_open(_target: Option<&str>) -> i32 {
+    eprintln!("this build has no window layer; rebuild with --features window");
+    2
+}
+
+#[cfg(not(feature = "cef"))]
+fn run_open(_target: Option<&str>) -> i32 {
+    eprintln!("this build has no web engine; rebuild with --features window");
     2
 }
 

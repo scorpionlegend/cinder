@@ -78,11 +78,12 @@ jobs:
         env:
           CINDER_CEF_ROOT: ${{ github.workspace }}/cef
         # The `cef` feature is off by default so a plain `cargo build` needs no
-        # CEF headers; a shipped bundle must turn it on or `browse` is missing.
+        # CEF headers; a shipped bundle must turn on `window`, which pulls in
+        # `cef`, or `cinder <url>` has no window to open.
         run: >
           cargo build --release --target ${{ matrix.target }}
           -p cinder-cli -p cinder-adapter-cef
-          --features cinder-cli/cef
+          --features cinder-cli/window
 
       - name: Package
         run: >
@@ -124,6 +125,12 @@ jobs:
           # without the `cef` feature. Fail if `browse` is missing.
           if $bin help | grep -q "no web engine"; then
             echo "bundle was built without the cef feature" >&2
+            exit 1
+          fi
+          # The window layer is what `cinder <url>` needs; a cef-only bundle
+          # would print help instead of opening a window.
+          if $bin help | grep -q "no window layer"; then
+            echo "bundle was built without the window feature" >&2
             exit 1
           fi
 

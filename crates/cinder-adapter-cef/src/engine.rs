@@ -10,7 +10,7 @@
 //! engine thread to accept the command, not for the command's effects.
 
 use std::collections::HashMap;
-use std::ffi::{c_char, c_int, c_void, CStr, CString};
+use std::ffi::{c_char, c_int, c_uchar, c_uint, c_void, CStr, CString};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -28,7 +28,7 @@ use cinder_adapter::policy::PolicySnapshot;
 use cinder_adapter::sanitize::Url;
 use cinder_adapter::view_state::ViewState;
 
-use crate::{Cef, CefError, STATE_CLOSED, STATE_CREATED};
+use crate::{Cef, CefError, Frame, STATE_CLOSED, STATE_CREATED};
 
 mod ffi {
     use super::*;
@@ -57,6 +57,50 @@ mod ffi {
         pub fn cinder_cef_set_visible(view_id: c_int, visible: c_int) -> c_int;
         pub fn cinder_cef_set_focus(view_id: c_int, focused: c_int) -> c_int;
         pub fn cinder_cef_view_state(view_id: c_int) -> c_int;
+        pub fn cinder_cef_view_frame_size(
+            view_id: c_int,
+            width: *mut c_int,
+            height: *mut c_int,
+        ) -> c_int;
+        pub fn cinder_cef_copy_view_frame(
+            view_id: c_int,
+            dst: *mut c_uchar,
+            capacity: c_int,
+        ) -> c_int;
+        pub fn cinder_cef_send_mouse_move(
+            view_id: c_int,
+            x: c_int,
+            y: c_int,
+            modifiers: c_uint,
+            leave: c_int,
+        );
+        pub fn cinder_cef_send_mouse_click(
+            view_id: c_int,
+            x: c_int,
+            y: c_int,
+            modifiers: c_uint,
+            button: c_int,
+            up: c_int,
+            click_count: c_int,
+        );
+        pub fn cinder_cef_send_mouse_wheel(
+            view_id: c_int,
+            x: c_int,
+            y: c_int,
+            modifiers: c_uint,
+            delta_x: c_int,
+            delta_y: c_int,
+        );
+        pub fn cinder_cef_send_key(
+            view_id: c_int,
+            kind: c_int,
+            modifiers: c_uint,
+            windows_key_code: c_int,
+            native_key_code: c_int,
+            is_system_key: c_int,
+            character: c_uint,
+            unmodified_character: c_uint,
+        );
         pub fn cinder_cef_set_policy(
             blocked_hosts: *const *const c_char,
             count: c_int,
@@ -73,6 +117,8 @@ const ACCEPT_TIMEOUT: Duration = Duration::from_secs(30);
 const CREATE_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long shutdown waits for views to confirm closure.
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long a frame copy or input forward waits for the engine thread.
+const FRAME_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Where CEF finds its resources and where it may write its cache.
 #[derive(Debug, Clone)]
@@ -120,9 +166,76 @@ pub const fn measured_capabilities() -> Capabilities {
     }
 }
 
-struct EngineRequest {
-    command: Command,
-    ack: Sender<Result<CommandOutcome, AdapterError>>,
+enum EngineRequest {
+    Command {
+        command: Command,
+        ack: Sender<Result<CommandOutcome, AdapterError>>,
+    },
+    /// Copy the last painted frame. Windowless rendering means the shell has to
+    /// pull pixels; CEF will not push them anywhere else.
+    Frame {
+        view: ViewId,
+        ack: Sender<Option<Frame>>,
+    },
+    /// Forward one OS input event into the page.
+    Input {
+        view: ViewId,
+        event: InputEvent,
+        ack: Sender<bool>,
+    },
+}
+
+/// One input event from the shell's window. Windowless rendering hides OS
+/// events from CEF entirely, so each one has to be replayed here.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum InputEvent {
+    MouseMove {
+        x: i32,
+        y: i32,
+        modifiers: u32,
+        leave: bool,
+    },
+    MouseClick {
+        x: i32,
+        y: i32,
+        modifiers: u32,
+        button: MouseButton,
+        up: bool,
+        click_count: i32,
+    },
+    MouseWheel {
+        x: i32,
+        y: i32,
+        modifiers: u32,
+        delta_x: i32,
+        delta_y: i32,
+    },
+    Key {
+        kind: KeyKind,
+        modifiers: u32,
+        windows_key_code: i32,
+        native_key_code: i32,
+        is_system_key: bool,
+        character: u32,
+        unmodified_character: u32,
+    },
+}
+
+/// `cef_mouse_button_type_t`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseButton {
+    Left = 0,
+    Middle = 1,
+    Right = 2,
+}
+
+/// `cef_key_event_type_t`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyKind {
+    RawKeyDown = 0,
+    KeyDown = 1,
+    KeyUp = 2,
+    Char = 3,
 }
 
 /// Shared with the C callback. Lives on the engine thread's stack frame and is
@@ -353,7 +466,7 @@ impl CefEngine {
         self.tx
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .send(EngineRequest {
+            .send(EngineRequest::Command {
                 command,
                 ack: ack_tx,
             })
@@ -364,6 +477,37 @@ impl CefEngine {
                 "engine thread did not accept the command".into(),
             )),
         }
+    }
+
+    /// Copy the view's last painted frame. Returns `None` before the first
+    /// paint or once the view is gone.
+    pub fn copy_frame(&self, view: ViewId) -> Option<Frame> {
+        let (ack_tx, ack_rx) = channel();
+        self.tx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .send(EngineRequest::Frame {
+                view,
+                ack: ack_tx,
+            })
+            .ok()?;
+        ack_rx.recv_timeout(FRAME_TIMEOUT).ok().flatten()
+    }
+
+    /// Forward one input event. Returns false if the view is unknown.
+    pub fn send_input(&self, view: ViewId, event: InputEvent) -> bool {
+        let (ack_tx, ack_rx) = channel();
+        let sent = self
+            .tx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .send(EngineRequest::Input {
+                view,
+                event,
+                ack: ack_tx,
+            })
+            .is_ok();
+        sent && ack_rx.recv_timeout(FRAME_TIMEOUT).unwrap_or(false)
     }
 }
 
@@ -465,20 +609,120 @@ fn run_engine(
         reconcile(&mut state, &sink);
 
         while let Ok(request) = cmd_rx.try_recv() {
-            if matches!(request.command, Command::Shutdown) {
-                let result = shutdown_views(&cef, &mut state, &sink);
-                let _ = request.ack.send(result);
-                finish(&cef, &sink, sink_ptr);
-                return;
+            match request {
+                EngineRequest::Command { command, ack } => {
+                    if matches!(command, Command::Shutdown) {
+                        let result = shutdown_views(&cef, &mut state, &sink);
+                        let _ = ack.send(result);
+                        finish(&cef, &sink, sink_ptr);
+                        return;
+                    }
+                    let result = handle(&cef, &mut state, &sink, &ids, command);
+                    let _ = ack.send(result);
+                }
+                EngineRequest::Frame { view, ack } => {
+                    let _ = ack.send(read_frame(view));
+                }
+                EngineRequest::Input { view, event, ack } => {
+                    let _ = ack.send(apply_input(view, event));
+                }
             }
-            let result = handle(&cef, &mut state, &sink, &ids, request.command);
-            let _ = request.ack.send(result);
         }
     }
 }
 
-fn finish(cef: &Cef, sink: &EventSink, sink_ptr: *mut c_void) {
-    sink.emit(None, Event::ShutdownComplete);
+/// Copy the view's last painted frame out of the shim. Runs on the engine
+/// thread, which is the only thread allowed to touch the shim.
+fn read_frame(view: ViewId) -> Option<Frame> {
+    let raw = view.get() as c_int;
+    let mut width: c_int = 0;
+    let mut height: c_int = 0;
+    // SAFETY: reads two ints the shim owns; no pointers escape.
+    let ok = unsafe { ffi::cinder_cef_view_frame_size(raw, &mut width, &mut height) };
+    if ok == 0 || width <= 0 || height <= 0 {
+        return None;
+    }
+    let mut bgra = vec![0u8; width as usize * height as usize * 4];
+    // SAFETY: the buffer is exactly the size the shim just reported.
+    let written = unsafe {
+        ffi::cinder_cef_copy_view_frame(raw, bgra.as_mut_ptr(), bgra.len() as c_int)
+    };
+    if written <= 0 {
+        return None;
+    }
+    bgra.truncate(written as usize);
+    Some(Frame {
+        width: width as u32,
+        height: height as u32,
+        bgra,
+    })
+}
+
+/// Replay one shell input event into the page. Runs on the engine thread.
+fn apply_input(view: ViewId, event: InputEvent) -> bool {
+    let raw = view.get() as c_int;
+    // SAFETY: every call passes plain integers; the shim owns the CEF objects.
+    unsafe {
+        match event {
+            InputEvent::MouseMove {
+                x,
+                y,
+                modifiers,
+                leave,
+            } => ffi::cinder_cef_send_mouse_move(
+                raw,
+                x,
+                y,
+                modifiers,
+                i32::from(leave),
+            ),
+            InputEvent::MouseClick {
+                x,
+                y,
+                modifiers,
+                button,
+                up,
+                click_count,
+            } => ffi::cinder_cef_send_mouse_click(
+                raw,
+                x,
+                y,
+                modifiers,
+                button as c_int,
+                i32::from(up),
+                click_count,
+            ),
+            InputEvent::MouseWheel {
+                x,
+                y,
+                modifiers,
+                delta_x,
+                delta_y,
+            } => ffi::cinder_cef_send_mouse_wheel(raw, x, y, modifiers, delta_x, delta_y),
+            InputEvent::Key {
+                kind,
+                modifiers,
+                windows_key_code,
+                native_key_code,
+                is_system_key,
+                character,
+                unmodified_character,
+            } => ffi::cinder_cef_send_key(
+                raw,
+                kind as c_int,
+                modifiers,
+                windows_key_code,
+                native_key_code,
+                i32::from(is_system_key),
+                character,
+                unmodified_character,
+            ),
+        }
+    }
+    true
+}
+
+fn finish(cef: &Cef, sink: &EventSink, sink_ptr: *mut c_void) {    sink.emit(None, Event::ShutdownComplete);
     // SAFETY: unregister before releasing the sink so no callback can observe a
     // dangling pointer.
     unsafe {

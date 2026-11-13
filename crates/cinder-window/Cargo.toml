@@ -1,0 +1,16 @@
+[package]
+name = "cinder-window"
+description = "Presents CEF's windowless frames in an OS window and replays OS input"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+cinder-adapter = { path = "../cinder-adapter" }
+cinder-adapter-cef = { path = "../cinder-adapter-cef" }
+winit = "0.30"
+softbuffer = "0.4"

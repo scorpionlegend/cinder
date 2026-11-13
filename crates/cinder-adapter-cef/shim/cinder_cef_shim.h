@@ -80,6 +80,25 @@ int cinder_cef_set_focus(int view_id, int focused);
 /* 0 for an unknown or already-released view. */
 int cinder_cef_view_state(int view_id);
 
+/* --------------------------------------------------------------- input --- */
+/* Windowless rendering hides OS events from CEF, so the shell forwards them.
+ * Coordinates are view-relative DIPs; `modifiers` uses cef_event_flags_t;
+ * `button` uses cef_mouse_button_type_t; `type` uses cef_key_event_type_t.
+ * Every call is a no-op for an unknown view. */
+
+void cinder_cef_send_mouse_move(int view_id, int x, int y, unsigned int modifiers,
+                                int leave);
+void cinder_cef_send_mouse_click(int view_id, int x, int y,
+                                 unsigned int modifiers, int button, int up,
+                                 int click_count);
+void cinder_cef_send_mouse_wheel(int view_id, int x, int y,
+                                 unsigned int modifiers, int delta_x,
+                                 int delta_y);
+void cinder_cef_send_key(int view_id, int type, unsigned int modifiers,
+                         int windows_key_code, int native_key_code,
+                         int is_system_key, unsigned int character,
+                         unsigned int unmodified_character);
+
 /* Size of the last painted frame. Returns 1 if a frame is available. */
 int cinder_cef_view_frame_size(int view_id, int* width, int* height);
 

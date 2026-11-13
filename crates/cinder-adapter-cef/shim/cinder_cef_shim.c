@@ -1053,6 +1053,101 @@ int cinder_cef_view_state(int view_id) {
   return v ? v->state : 0;
 }
 
+/* --------------------------------------------------------------- input --- */
+
+/* Windowless rendering means CEF never sees an OS event, so the shell has to
+ * forward every one of them. All of these are no-ops for an unknown view. */
+
+void cinder_cef_send_mouse_move(int view_id, int x, int y, unsigned int modifiers,
+                                int leave) {
+  cinder_view_t* v = view_by_id(view_id);
+  cef_browser_host_t* host;
+  cef_mouse_event_t event;
+  if (!v || !v->browser) {
+    return;
+  }
+  host = acquire_host(v->browser);
+  if (!host) {
+    return;
+  }
+  memset(&event, 0, sizeof(event));
+  event.x = x;
+  event.y = y;
+  event.modifiers = modifiers;
+  host->send_mouse_move_event(host, &event, leave ? 1 : 0);
+  release_host(host);
+}
+
+void cinder_cef_send_mouse_click(int view_id, int x, int y,
+                                 unsigned int modifiers, int button, int up,
+                                 int click_count) {
+  cinder_view_t* v = view_by_id(view_id);
+  cef_browser_host_t* host;
+  cef_mouse_event_t event;
+  if (!v || !v->browser) {
+    return;
+  }
+  host = acquire_host(v->browser);
+  if (!host) {
+    return;
+  }
+  memset(&event, 0, sizeof(event));
+  event.x = x;
+  event.y = y;
+  event.modifiers = modifiers;
+  host->send_mouse_click_event(host, &event, (cef_mouse_button_type_t)button,
+                               up ? 1 : 0, click_count);
+  release_host(host);
+}
+
+void cinder_cef_send_mouse_wheel(int view_id, int x, int y,
+                                 unsigned int modifiers, int delta_x,
+                                 int delta_y) {
+  cinder_view_t* v = view_by_id(view_id);
+  cef_browser_host_t* host;
+  cef_mouse_event_t event;
+  if (!v || !v->browser) {
+    return;
+  }
+  host = acquire_host(v->browser);
+  if (!host) {
+    return;
+  }
+  memset(&event, 0, sizeof(event));
+  event.x = x;
+  event.y = y;
+  event.modifiers = modifiers;
+  host->send_mouse_wheel_event(host, &event, delta_x, delta_y);
+  release_host(host);
+}
+
+void cinder_cef_send_key(int view_id, int type, unsigned int modifiers,
+                         int windows_key_code, int native_key_code,
+                         int is_system_key, unsigned int character,
+                         unsigned int unmodified_character) {
+  cinder_view_t* v = view_by_id(view_id);
+  cef_browser_host_t* host;
+  cef_key_event_t event;
+  if (!v || !v->browser) {
+    return;
+  }
+  host = acquire_host(v->browser);
+  if (!host) {
+    return;
+  }
+  memset(&event, 0, sizeof(event));
+  event.size = sizeof(event);
+  event.type = (cef_key_event_type_t)type;
+  event.modifiers = modifiers;
+  event.windows_key_code = windows_key_code;
+  event.native_key_code = native_key_code;
+  event.is_system_key = is_system_key ? 1 : 0;
+  event.character = (char16_t)character;
+  event.unmodified_character = (char16_t)unmodified_character;
+  host->send_key_event(host, &event);
+  release_host(host);
+}
+
 int cinder_cef_view_frame_size(int view_id, int* width, int* height) {
   cinder_view_t* v = view_by_id(view_id);
   if (!v || !v->frame || v->width <= 0 || v->height <= 0) {

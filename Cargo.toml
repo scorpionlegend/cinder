@@ -7,6 +7,7 @@ members = [
     "crates/cinder-core",
     "crates/cinder-cli",
     "crates/cinder-dist",
+    "crates/cinder-window",
 ]
 
 [workspace.package]
