@@ -33,7 +33,9 @@ fn main() {
     }
 
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let command = args.first().map(String::as_str).unwrap_or("help");
+    // No arguments means the desktop entry was clicked: open the window rather
+    // than printing help into a terminal nobody can see.
+    let command = args.first().map(String::as_str).unwrap_or("open");
 
     let code = match command {
         "demo" => run_demo(),
@@ -439,6 +441,19 @@ fn run_browse(_target: Option<&str>) -> i32 {
 }
 
 #[cfg(feature = "window")]
+/// Chromium switches for the windowed path. `CINDER_CEF_ARGS` overrides them so
+/// a flag combination can be tried without a rebuild.
+fn window_args() -> Vec<String> {
+    if let Ok(raw) = std::env::var("CINDER_CEF_ARGS") {
+        return raw.split_whitespace().map(str::to_string).collect();
+    }
+    vec![
+        "--disable-gpu".into(),
+        "--disable-gpu-compositing".into(),
+        "--disable-dev-shm-usage".into(),
+    ]
+}
+
 fn run_open(target: Option<&str>) -> i32 {
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -462,13 +477,9 @@ fn run_open(target: Option<&str>) -> i32 {
         // Windowless rendering needs software compositing to produce OnPaint
         // frames; the GPU path paints into a surface nobody can read. CEF's own
         // display connection stays headless — the visible window belongs to
-        // winit, not to Chromium.
-        extra_args: vec![
-            "--disable-gpu".into(),
-            "--disable-gpu-compositing".into(),
-            "--disable-software-rasterizer".into(),
-            "--disable-dev-shm-usage".into(),
-        ],
+        // winit, not to Chromium. The software rasterizer must stay enabled:
+        // disabling it leaves every frame black.
+        extra_args: window_args(),
         capabilities: cinder_adapter_cef::measured_capabilities(),
     };
 

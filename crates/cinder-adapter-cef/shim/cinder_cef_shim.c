@@ -317,6 +317,14 @@ static void CEF_CALLBACK render_on_paint(struct _cef_render_handler_t* self,
   v->width = width;
   v->height = height;
   v->state |= CINDER_CEF_PAINTED;
+  if (getenv("CINDER_CEF_TRACE")) {
+    static int paints;
+    paints++;
+    fprintf(stderr, "[cef] on_paint #%d %dx%d first=%02x%02x%02x%02x\n", paints, width,
+            height, ((const unsigned char*)buffer)[0],
+            ((const unsigned char*)buffer)[1], ((const unsigned char*)buffer)[2],
+            ((const unsigned char*)buffer)[3]);
+  }
   emit(v->id, CINDER_CEF_EV_PAINTED, NULL, NULL);
 }
 
@@ -444,6 +452,15 @@ static void CEF_CALLBACK load_on_loading_state_change(
   } else {
     v->state |= CINDER_CEF_LOADED;
     emit(v->id, CINDER_CEF_EV_LOAD_END, v->url, NULL);
+    /* A windowless view only paints when something asks it to. Without this
+     * the first (blank) frame is the only one CEF ever produces. */
+    if (browser) {
+      cef_browser_host_t* host = browser->get_host(browser);
+      if (host) {
+        host->invalidate(host, PET_VIEW);
+        host->base.release((cef_base_ref_counted_t*)host);
+      }
+    }
   }
 }
 
@@ -828,7 +845,9 @@ int cinder_cef_create_view(int view_id, const char* url, int width, int height) 
 
   memset(&browser_settings, 0, sizeof(browser_settings));
   browser_settings.size = sizeof(cef_browser_settings_t);
-  browser_settings.windowless_frame_rate = 30;
+  /* 0 disables BeginFrame scheduling: this shim never sends external begin
+   * frames, so a non-zero rate would leave CEF waiting for them. */
+  browser_settings.windowless_frame_rate = 0;
 
   cef_string_from_utf8(url ? url : "about:blank", strlen(url ? url : "about:blank"),
                        &url_str);
