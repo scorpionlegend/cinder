@@ -457,14 +457,24 @@ fn run_browse(_target: Option<&str>) -> i32 {
 #[cfg(feature = "window")]
 /// Chromium switches for the windowed path.
 fn window_args() -> Vec<String> {
-    vec![
-        // The shell is an X11 window (XWayland under a Wayland session) and CEF
-        // embeds an X11 child in it, so Chromium must not pick the Wayland
-        // backend.
+    // The shell is an X11 window (XWayland under a Wayland session) and CEF
+    // embeds an X11 child in it, so Chromium must not pick the Wayland
+    // backend. Windows and macOS have no ozone backends and reject the switch.
+    #[cfg(target_os = "linux")]
+    let mut args: Vec<String> = vec![
         "--ozone-platform=x11".into(),
-        "--disable-gpu".into(),
+        // No /dev/shm in some containers.
         "--disable-dev-shm-usage".into(),
-    ]
+    ];
+    #[cfg(not(target_os = "linux"))]
+    let mut args: Vec<String> = Vec::new();
+    // No GPU on CI runners.
+    args.push("--disable-gpu".into());
+    // A headless macOS runner has no window server session for the GPU
+    // process, which then aborts the browser with "GPU process isn't usable".
+    #[cfg(target_os = "macos")]
+    args.push("--disable-gpu-sandbox".into());
+    args
 }
 
 fn run_open(target: Option<&str>) -> i32 {
@@ -506,7 +516,9 @@ fn run_open(target: Option<&str>) -> i32 {
     };
 
     let policy = Arc::new(PolicySnapshot::new(1).with_https_upgrade(true));
-    let browser = match Browser::new(engine.clone(), policy, "/tmp/cinder-window-profile") {
+    let profile = std::env::temp_dir().join("cinder-window-profile");
+    let profile = profile.to_string_lossy().into_owned();
+    let browser = match Browser::new(engine.clone(), policy, &profile) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("failed to start orchestrator: {e}");

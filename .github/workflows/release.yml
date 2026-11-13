@@ -161,8 +161,9 @@ jobs:
             *darwin*) bin=./smoke/cinder-*/Cinder.app/Contents/MacOS/cinder ;;
             *windows*) bin=./smoke/cinder-*/cinder.exe ;;
           esac
-          out=$(CINDER_NO_UPDATE_CHECK=1 CINDER_WINDOW_SELFTEST=8 $bin about:blank 2>&1 || true)
+          out=$(CINDER_NO_UPDATE_CHECK=1 CINDER_WINDOW_SELFTEST=8 $bin about:blank 2>&1) && code=0 || code=$?
           echo "$out"
+          echo "exit code: $code"
           if ! grep -q "window selftest: .*view=view-" <<<"$out"; then
             echo "the window never got a page view" >&2
             exit 1
