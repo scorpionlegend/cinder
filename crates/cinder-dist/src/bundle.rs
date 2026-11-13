@@ -78,17 +78,31 @@ const LINUX_RUNTIME: &[&str] = &[
     "chrome-sandbox",
 ];
 
-const WINDOWS_RUNTIME: &[&str] = &[
+/// Files the Windows CEF distribution keeps in `Release/`.
+///
+/// `d3dcompiler_47.dll` is what ANGLE compiles its D3D11 shaders with; without
+/// it Chromium falls back to software rendering.
+const WINDOWS_RELEASE: &[&str] = &[
     "libcef.dll",
     "chrome_elf.dll",
-    "icudtl.dat",
-    "chrome_100_percent.pak",
-    "chrome_200_percent.pak",
-    "resources.pak",
+    "d3dcompiler_47.dll",
     "v8_context_snapshot.bin",
     "vk_swiftshader.dll",
     "vulkan-1.dll",
     "vk_swiftshader_icd.json",
+];
+
+/// Files the Windows CEF distribution keeps in `Resources/`.
+///
+/// Unlike Linux, where these sit next to `libcef.so`, the Windows archive
+/// splits them into a separate directory. Reading them from `Release/` silently
+/// produced a bundle with no ICU data and no pak files, which starts but cannot
+/// render a page.
+const WINDOWS_RESOURCES: &[&str] = &[
+    "icudtl.dat",
+    "chrome_100_percent.pak",
+    "chrome_200_percent.pak",
+    "resources.pak",
 ];
 
 fn locales(dir: &Path) -> io::Result<Vec<PathBuf>> {
@@ -211,6 +225,7 @@ pub fn linux_entries(input: &BundleInput<'_>) -> io::Result<Vec<Entry>> {
 pub fn windows_entries(input: &BundleInput<'_>) -> io::Result<Vec<Entry>> {
     let root = root_name(input);
     let release = input.cef_root.join("Release");
+    let resources = input.cef_root.join("Resources");
     let mut out = vec![Entry::dir(root.clone(), 0o755)];
 
     for bin in ["cinder", "cef-spike"] {
@@ -223,13 +238,19 @@ pub fn windows_entries(input: &BundleInput<'_>) -> io::Result<Vec<Entry>> {
             ));
         }
     }
-    for name in WINDOWS_RUNTIME {
+    for name in WINDOWS_RELEASE {
         let src = release.join(name);
         if src.exists() {
             out.push(Entry::file(format!("{root}/{name}"), src, 0o644));
         }
     }
-    let locale_dir = release.join("locales");
+    for name in WINDOWS_RESOURCES {
+        let src = resources.join(name);
+        if src.exists() {
+            out.push(Entry::file(format!("{root}/{name}"), src, 0o644));
+        }
+    }
+    let locale_dir = resources.join("locales");
     if locale_dir.is_dir() {
         out.push(Entry::dir(format!("{root}/locales"), 0o755));
         for pak in locales(&locale_dir)? {
@@ -386,4 +407,118 @@ pub fn deb_data_entries(linux: &[Entry], root: &str) -> Vec<Entry> {
         0o644,
     ));
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A throwaway directory tree, removed on drop.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "cinder-dist-test-{name}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("create scratch dir");
+            Self(dir)
+        }
+
+        fn file(&self, rel: &str) -> PathBuf {
+            let path = self.0.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).expect("create parent");
+            std::fs::write(&path, rel.as_bytes()).expect("write file");
+            path
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn windows_input<'a>(
+        scratch: &'a Scratch,
+        target: &'a Target,
+        bin_dir: &'a Path,
+        cef_root: &'a Path,
+        libcef: &'a Path,
+    ) -> BundleInput<'a> {
+        let _ = scratch;
+        BundleInput {
+            target,
+            version: "0.1.0-test",
+            bin_dir,
+            cef_root,
+            cef_version: "test",
+            libcef,
+        }
+    }
+
+    /// The Windows CEF archive keeps the pak files and ICU data in `Resources/`,
+    /// not next to the DLLs. Reading them from `Release/` produced a bundle that
+    /// started but could not render, so this pins the split layout.
+    #[test]
+    fn windows_bundle_takes_resources_from_the_resources_directory() {
+        let scratch = Scratch::new("win-resources");
+        let cef = scratch.0.join("cef");
+        for name in WINDOWS_RELEASE {
+            scratch.file(&format!("cef/Release/{name}"));
+        }
+        for name in WINDOWS_RESOURCES {
+            scratch.file(&format!("cef/Resources/{name}"));
+        }
+        scratch.file("cef/Resources/locales/en-US.pak");
+        scratch.file("cef/Resources/locales/de.pak");
+        let bin = scratch.file("bin/cinder.exe");
+        let bin_dir = bin.parent().unwrap().to_path_buf();
+
+        let target = Target::parse("x86_64-pc-windows-msvc").unwrap();
+        let libcef = cef.join("Release/libcef.dll");
+        let input = windows_input(&scratch, &target, &bin_dir, &cef, &libcef);
+        let entries = windows_entries(&input).expect("windows entries");
+
+        let paths: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
+        let root = root_name(&input);
+        for name in WINDOWS_RESOURCES {
+            let want = format!("{root}/{name}");
+            assert!(paths.contains(&want.as_str()), "missing {want} in {paths:?}");
+        }
+        assert!(paths.contains(&format!("{root}/locales/en-US.pak").as_str()));
+        assert!(paths.contains(&format!("{root}/locales/de.pak").as_str()));
+        assert!(paths.contains(&format!("{root}/cinder.exe").as_str()));
+
+        // Every file entry must point at something that exists; a silently
+        // skipped source is how the missing-resources bug stayed invisible.
+        for entry in &entries {
+            if let Some(source) = entry.source.as_ref() {
+                assert!(source.exists(), "entry {} has no source", entry.path);
+            }
+        }
+    }
+
+    #[test]
+    fn windows_bundle_skips_absent_optional_files() {
+        let scratch = Scratch::new("win-optional");
+        let cef = scratch.0.join("cef");
+        scratch.file("cef/Release/libcef.dll");
+        scratch.file("cef/Resources/icudtl.dat");
+        let bin = scratch.file("bin/cinder.exe");
+        let bin_dir = bin.parent().unwrap().to_path_buf();
+
+        let target = Target::parse("x86_64-pc-windows-msvc").unwrap();
+        let libcef = cef.join("Release/libcef.dll");
+        let input = windows_input(&scratch, &target, &bin_dir, &cef, &libcef);
+        let entries = windows_entries(&input).expect("windows entries");
+        let paths: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
+
+        assert!(paths.iter().any(|p| p.ends_with("/libcef.dll")));
+        assert!(paths.iter().any(|p| p.ends_with("/icudtl.dat")));
+        assert!(!paths.iter().any(|p| p.ends_with("/d3dcompiler_47.dll")));
+        assert!(!paths.iter().any(|p| p.contains("/locales/")));
+    }
 }

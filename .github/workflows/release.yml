@@ -136,6 +136,18 @@ jobs:
             echo "bundle was built without the window feature" >&2
             exit 1
           fi
+          # A bundle without ICU data or pak files still starts, but cannot
+          # render: CEF needs icudtl.dat and at least one locale pak. The
+          # Windows archive keeps them in Resources/, so a wrong source path
+          # drops them silently.
+          if ! find smoke -name icudtl.dat -print -quit | grep -q .; then
+            echo "bundle has no icudtl.dat" >&2
+            exit 1
+          fi
+          if ! find smoke -path '*locales/*.pak' -print -quit | grep -q .; then
+            echo "bundle has no locales/*.pak" >&2
+            exit 1
+          fi
 
       # Windows ships an .msi and a setup .exe on top of the portable .zip.
       # Both are built from the same staged bundle the smoke test just ran.
