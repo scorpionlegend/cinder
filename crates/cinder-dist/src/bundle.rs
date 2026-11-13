@@ -302,15 +302,16 @@ pub fn macos_entries(input: &BundleInput<'_>) -> io::Result<Vec<Entry>> {
         walk(&framework, &format!("{app}/Frameworks/Chromium Embedded Framework.framework"), &mut out)?;
     }
     // CEF resolves icudtl.dat and the .pak files next to the framework's
-    // Resources directory; keep a copy in the app bundle as well.
+    // Resources directory; keep a copy in the app bundle as well. The macOS
+    // distribution keeps them inside the framework, which `walk` already
+    // copied, so these lookups may legitimately find nothing.
     for name in ["icudtl.dat", "chrome_100_percent.pak", "chrome_200_percent.pak", "resources.pak", "v8_context_snapshot.bin"] {
-        let src = release.join(name);
-        if src.exists() {
-            out.push(Entry::file(format!("{app}/Resources/{name}"), src, 0o644));
-        }
+        let Some(src) = resource(input, name) else {
+            continue;
+        };
+        out.push(Entry::file(format!("{app}/Resources/{name}"), src, 0o644));
     }
-    let locale_dir = release.join("locales");
-    if locale_dir.is_dir() {
+    if let Some(locale_dir) = locale_dir(input) {
         out.push(Entry::dir(format!("{app}/Resources/locales"), 0o755));
         for pak in locales(&locale_dir)? {
             let name = pak.file_name().unwrap().to_string_lossy().into_owned();

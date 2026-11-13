@@ -137,11 +137,14 @@ jobs:
             exit 1
           fi
           # A bundle without ICU data or pak files still starts, but cannot
-          # render: CEF needs icudtl.dat and at least one locale pak. The
-          # Windows archive keeps them in Resources/, so a wrong source path
-          # drops them silently.
+          # render: CEF needs icudtl.dat and at least one locale pak. Linux and
+          # Windows keep them in locales/*.pak, macOS in *.lproj/locale.pak.
           if ! find smoke -name icudtl.dat -print -quit | grep -q .; then
             echo "bundle has no icudtl.dat" >&2
+            exit 1
+          fi
+          if ! find smoke \( -path '*locales/*.pak' -o -path '*.lproj/locale.pak' \) -print -quit | grep -q .; then
+            echo "bundle has no locale pak" >&2
             exit 1
           fi
           if ! find smoke -path '*locales/*.pak' -print -quit | grep -q .; then

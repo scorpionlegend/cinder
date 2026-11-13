@@ -52,6 +52,8 @@ fn main() {
         "windows" => {
             println!("cargo:rustc-link-search=native={}", release_dir.display());
             println!("cargo:rustc-link-lib=dylib=libcef");
+            // The shim resizes the browser view with MoveWindow.
+            println!("cargo:rustc-link-lib=dylib=user32");
             copy_runtime_dlls(&release_dir);
         }
         "macos" => {
