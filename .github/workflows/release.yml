@@ -183,15 +183,25 @@ jobs:
           & "$wix\light.exe" -sval -out $msi obj\*.wixobj
           if ($LASTEXITCODE -ne 0) { throw "light failed" }
 
-          # Prove the MSI really carries the browser. First a cheap structural
-          # check: dark decompiles the package and extracts its payload, so a
-          # missing cinder.exe fails here with a clear message instead of
-          # surfacing as a mysterious msiexec exit code.
-          $dark = Join-Path $PWD 'msi-dark'
-          & "$wix\dark.exe" -nologo -x $dark $msi | Out-Null
-          if ($LASTEXITCODE -ne 0) { throw "dark failed on $msi" }
-          if (-not (Get-ChildItem $dark -Recurse -Filter cinder.exe -ErrorAction SilentlyContinue)) {
-            throw "MSI payload has no cinder.exe"
+          # Ask the package itself what it carries: the File table is the
+          # authoritative list, and reading it costs nothing next to extracting
+          # a 600 MB payload.
+          $installer = New-Object -ComObject WindowsInstaller.Installer
+          $db = $installer.GetType().InvokeMember('OpenDatabase', 'InvokeMethod', $null,
+            $installer, @((Resolve-Path $msi).Path, 0))
+          $view = $db.GetType().InvokeMember('OpenView', 'InvokeMethod', $null, $db,
+            @('SELECT `File` FROM `File`'))
+          $view.GetType().InvokeMember('Execute', 'InvokeMethod', $null, $view, $null)
+          $names = @()
+          while ($true) {
+            $row = $view.GetType().InvokeMember('Fetch', 'InvokeMethod', $null, $view, $null)
+            if ($null -eq $row) { break }
+            $names += $row.GetType().InvokeMember('StringData', 'GetProperty', $null, $row, @(1))
+          }
+          Write-Host "MSI File table: $($names.Count) entries"
+          if ($names.Count -eq 0) { throw "MSI File table is empty: heat harvested nothing" }
+          if (-not ($names -match '^cinder\.exe$')) {
+            throw "MSI File table has no cinder.exe (first entries: $($names[0..4] -join ', '))"
           }
 
           # Then the real thing: an administrative install unpacks every file
