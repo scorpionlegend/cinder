@@ -780,11 +780,19 @@ impl EngineCore {
         match request {
             EngineRequest::Command { command, ack } => {
                 if matches!(command, Command::Shutdown) {
-                    let result = shutdown_views(&self.cef, &mut self.state, &self.sink);
+                    let result =
+                        shutdown_views(&self.cef, &mut self.state, &self.sink, self.host_pumps);
                     let _ = ack.send(result);
                     return false;
                 }
-                let result = handle(&self.cef, &mut self.state, &self.sink, &self.ids, command);
+                let result = handle(
+                    &self.cef,
+                    &mut self.state,
+                    &self.sink,
+                    &self.ids,
+                    command,
+                    self.host_pumps,
+                );
                 let _ = ack.send(result);
             }
             EngineRequest::Frame { view, ack } => {
@@ -973,6 +981,8 @@ fn reconcile(state: &mut EngineState, sink: &EventSink) {
         if raw & STATE_CLOSED != 0 {
             *view_state = ViewState::Closed;
             sink.unbind(view.get() as i32);
+        } else if raw & STATE_CREATED != 0 && matches!(view_state, ViewState::Creating) {
+            *view_state = ViewState::Live;
         }
     }
 }
@@ -981,6 +991,7 @@ fn shutdown_views(
     cef: &Cef,
     state: &mut EngineState,
     sink: &EventSink,
+    host_pumps: bool,
 ) -> Result<CommandOutcome, AdapterError> {
     let open: Vec<ViewId> = state
         .views
@@ -998,7 +1009,9 @@ fn shutdown_views(
 
     let deadline = Instant::now() + CLOSE_TIMEOUT;
     while Instant::now() < deadline {
-        cef.pump(PUMP_MS);
+        if host_pumps {
+            cef.pump(PUMP_MS);
+        }
         reconcile(state, sink);
         if state.views.values().all(|s| s.is_terminal()) {
             break;
@@ -1030,6 +1043,7 @@ fn handle(
     sink: &EventSink,
     ids: &IdAllocator,
     command: Command,
+    host_pumps: bool,
 ) -> Result<CommandOutcome, AdapterError> {
     match command {
         Command::Shutdown => Ok(CommandOutcome::Done),
@@ -1097,6 +1111,13 @@ fn handle(
 
             state.views.insert(view, ViewState::Creating);
             sink.bind(raw, view);
+            // Waiting means pumping, and pumping runs a nested run loop on
+            // macOS, which re-enters the host's event handler. Where the host
+            // does not pump, the view is reported as created straight away and
+            // the run loop timer promotes it once CEF reports the browser.
+            if !host_pumps {
+                return Ok(CommandOutcome::ViewCreated(view));
+            }
             if !wait_for_created(cef, raw) {
                 state.views.insert(view, ViewState::Failed);
                 sink.unbind(raw);
