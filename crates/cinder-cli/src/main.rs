@@ -61,6 +61,9 @@ fn main() {
         "browse" => run_browse(args.get(1).map(String::as_str)),
         "open" => run_open(args.get(1).map(String::as_str)),
         "update" => run_update(),
+        "bookmarks" => run_bookmarks(&args[1..]),
+        "history" => run_history(&args[1..]),
+        "settings" => run_settings(&args[1..]),
         other if looks_like_url(other) => run_open(Some(other)),
         "version" | "--version" | "-V" => {
             println!("cinder {} (adapter api 0.1)", version_string());
@@ -145,6 +148,9 @@ fn print_help() {
     println!("  cinder demo      run a scripted session: tabs, policy, decisions, restore, shutdown");
     println!("  cinder browse <url>  load a real page headlessly and report the result");
     println!("  cinder update    check the published releases for a newer version");
+    println!("  cinder bookmarks [add <url> [title] | remove <url> | list]");
+    println!("  cinder history [list | clear]");
+    println!("  cinder settings [list | get <key> | set <key> <value>]");
     println!("  cinder version   print the version");
     println!("  cinder help      this text");
     println!();
@@ -365,6 +371,199 @@ fn run_demo() -> i32 {
 
     println!("\ndemo finished");
     0
+}
+
+/// Where bookmarks, history and settings live.
+fn state_dir() -> std::path::PathBuf {
+    if let Some(dir) = std::env::var_os("CINDER_STATE_DIR") {
+        return dir.into();
+    }
+    #[cfg(target_os = "windows")]
+    if let Some(appdata) = std::env::var_os("APPDATA") {
+        return std::path::PathBuf::from(appdata).join("Cinder");
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(home) = std::env::var_os("HOME") {
+        return std::path::PathBuf::from(home).join("Library/Application Support/Cinder");
+    }
+    if let Some(data) = std::env::var_os("XDG_DATA_HOME") {
+        return std::path::PathBuf::from(data).join("cinder");
+    }
+    let home = std::env::var_os("HOME").unwrap_or_default();
+    std::path::PathBuf::from(home).join(".local/share/cinder")
+}
+
+/// UTC `YYYY-MM-DD HH:MM` for a Unix timestamp, without a date dependency.
+fn format_time(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    // Howard Hinnant's civil-from-days, with the epoch shifted to 0000-03-01.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!(
+        "{y:04}-{m:02}-{d:02} {:02}:{:02}",
+        rem / 3600,
+        (rem % 3600) / 60
+    )
+}
+
+fn run_bookmarks(args: &[String]) -> i32 {
+    let mut store = match cinder_core::Store::open(state_dir()) {
+        Ok(store) => store,
+        Err(e) => {
+            eprintln!("could not open {}: {e}", state_dir().display());
+            return 1;
+        }
+    };
+    match args.first().map(String::as_str).unwrap_or("list") {
+        "list" => {
+            for bookmark in store.bookmarks() {
+                println!("{}\t{}", bookmark.url, bookmark.title);
+            }
+            0
+        }
+        "add" => {
+            let Some(url) = args.get(1) else {
+                eprintln!("usage: cinder bookmarks add <url> [title]");
+                return 2;
+            };
+            let title = args.get(2).map(String::as_str).unwrap_or(url);
+            match store.add_bookmark(url, title) {
+                Ok(true) => {
+                    println!("bookmarked {url}");
+                    0
+                }
+                Ok(false) => {
+                    println!("already bookmarked {url}");
+                    0
+                }
+                Err(e) => {
+                    eprintln!("could not save bookmarks: {e}");
+                    1
+                }
+            }
+        }
+        "remove" => {
+            let Some(url) = args.get(1) else {
+                eprintln!("usage: cinder bookmarks remove <url>");
+                return 2;
+            };
+            match store.remove_bookmark(url) {
+                Ok(true) => {
+                    println!("removed {url}");
+                    0
+                }
+                Ok(false) => {
+                    println!("not bookmarked: {url}");
+                    1
+                }
+                Err(e) => {
+                    eprintln!("could not save bookmarks: {e}");
+                    1
+                }
+            }
+        }
+        other => {
+            eprintln!("unknown bookmarks command: {other}");
+            2
+        }
+    }
+}
+
+fn run_history(args: &[String]) -> i32 {
+    let mut store = match cinder_core::Store::open(state_dir()) {
+        Ok(store) => store,
+        Err(e) => {
+            eprintln!("could not open {}: {e}", state_dir().display());
+            return 1;
+        }
+    };
+    match args.first().map(String::as_str).unwrap_or("list") {
+        "list" => {
+            for visit in store.recent(50) {
+                println!(
+                    "{}\t{}\t{}",
+                    format_time(visit.visited),
+                    visit.url,
+                    visit.title
+                );
+            }
+            0
+        }
+        "clear" => match store.clear_history() {
+            Ok(()) => {
+                println!("history cleared");
+                0
+            }
+            Err(e) => {
+                eprintln!("could not clear history: {e}");
+                1
+            }
+        },
+        other => {
+            eprintln!("unknown history command: {other}");
+            2
+        }
+    }
+}
+
+fn run_settings(args: &[String]) -> i32 {
+    let mut store = match cinder_core::Store::open(state_dir()) {
+        Ok(store) => store,
+        Err(e) => {
+            eprintln!("could not open {}: {e}", state_dir().display());
+            return 1;
+        }
+    };
+    match args.first().map(String::as_str).unwrap_or("list") {
+        "list" => {
+            for (key, value) in store.settings() {
+                println!("{key}\t{value}");
+            }
+            0
+        }
+        "get" => {
+            let Some(key) = args.get(1) else {
+                eprintln!("usage: cinder settings get <key>");
+                return 2;
+            };
+            match store.setting(key) {
+                Some(value) => {
+                    println!("{value}");
+                    0
+                }
+                None => 1,
+            }
+        }
+        "set" => {
+            let (Some(key), Some(value)) = (args.get(1), args.get(2)) else {
+                eprintln!("usage: cinder settings set <key> <value>");
+                return 2;
+            };
+            match store.set_setting(key, value) {
+                Ok(()) => {
+                    println!("{key} = {value}");
+                    0
+                }
+                Err(e) => {
+                    eprintln!("could not save settings: {e}");
+                    1
+                }
+            }
+        }
+        other => {
+            eprintln!("unknown settings command: {other}");
+            2
+        }
+    }
 }
 
 #[cfg(feature = "cef")]
@@ -745,6 +944,7 @@ fn run_open(target: Option<&str>) -> i32 {    use std::cell::RefCell;
                 .collect()
         }),
     };
+    let mut store = cinder_core::Store::open(state_dir()).ok();
     let result = cinder_window::run_on_with_tabs(
         event_loop,
         engine.clone(),
@@ -781,7 +981,12 @@ fn run_open(target: Option<&str>) -> i32 {    use std::cell::RefCell;
         for effect in browser.pump() {
             match effect {
                 Effect::TitleChanged { title, .. } => println!("  title -> {title}"),
-                Effect::LoadFinished { .. } => println!("  load finished"),
+                Effect::LoadFinished { tab, .. } => {
+                    println!("  load finished");
+                    if let (Some(store), Some(tab)) = (store.as_mut(), browser.tab(tab)) {
+                        let _ = store.record_visit(tab.display_url(), &tab.title);
+                    }
+                }
                 Effect::LoadFailed { reason, .. } => println!("  load failed ({reason:?})"),
                 Effect::EngineFault { message } => eprintln!("  engine fault: {message}"),
                 other => {
@@ -915,6 +1120,12 @@ fn truncate(input: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::looks_like_url;
+
+    #[test]
+    fn formats_utc_timestamps() {
+        assert_eq!(super::format_time(0), "1970-01-01 00:00");
+        assert_eq!(super::format_time(1_700_000_000), "2023-11-14 22:13");
+    }
 
     #[test]
     fn recognises_urls_and_schemes() {
