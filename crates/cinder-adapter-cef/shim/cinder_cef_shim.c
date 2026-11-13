@@ -763,12 +763,55 @@ static cef_client_t g_client = {
 
 /* ---------------------------------------------------------------- app ---- */
 
+/* Switches the host wants Chromium to see. On Windows cef_main_args_t carries
+ * only the module handle, so argv never reaches Chromium's command line; the
+ * app's on_before_command_line_processing hook is the only portable way in. */
+#define CINDER_MAX_SWITCHES 32
+static char g_switches[CINDER_MAX_SWITCHES][160];
+static int g_switch_count = 0;
+
+void cinder_cef_add_switch(const char* switch_text) {
+  if (!switch_text || !switch_text[0] || g_switch_count >= CINDER_MAX_SWITCHES) {
+    return;
+  }
+  snprintf(g_switches[g_switch_count], sizeof(g_switches[0]), "%s", switch_text);
+  g_switch_count++;
+}
+
+static void app_on_before_command_line_processing(
+    cef_app_t* self, const cef_string_t* process_type,
+    cef_command_line_t* command_line) {
+  int i;
+  (void)self;
+  (void)process_type;
+  if (!command_line) {
+    return;
+  }
+  for (i = 0; i < g_switch_count; i++) {
+    const char* text = g_switches[i];
+    const char* eq = strchr(text, '=');
+    cef_string_t name = {0};
+    if (eq) {
+      cef_string_t value = {0};
+      cef_string_from_utf8(text, (size_t)(eq - text), &name);
+      cef_string_from_utf8(eq + 1, strlen(eq + 1), &value);
+      command_line->append_switch_with_value(command_line, &name, &value);
+      cef_string_clear(&value);
+    } else {
+      cef_string_from_utf8(text, strlen(text), &name);
+      command_line->append_switch(command_line, &name);
+    }
+    cef_string_clear(&name);
+  }
+}
+
 static cef_app_t g_app = {
     .base = {.size = sizeof(cef_app_t),
              .add_ref = app_add_ref,
              .release = app_release,
              .has_one_ref = app_has_one_ref,
              .has_at_least_one_ref = app_has_at_least_one_ref},
+    .on_before_command_line_processing = app_on_before_command_line_processing,
 };
 
 /* --------------------------------------------------------------- public --- */

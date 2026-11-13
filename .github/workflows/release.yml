@@ -218,13 +218,21 @@ jobs:
       - name: Window selftest backtrace
         if: always() && contains(matrix.target, 'darwin')
         continue-on-error: true
-        timeout-minutes: 10
+        timeout-minutes: 5
         shell: bash
         run: |
           set -euo pipefail
+          out="$RUNNER_TEMP/selftest.out"
+          if [ -f "$out" ] && grep -q "window selftest: .*view=view-" "$out"; then
+            echo "selftest produced a view; no backtrace needed"
+            exit 0
+          fi
           bin=$(echo ./smoke/cinder-*/Cinder.app/Contents/MacOS/cinder)
-          lldb -b -o "settings set target.env-vars CINDER_WINDOW_SELFTEST=8 CINDER_NO_UPDATE_CHECK=1" \
-            -o run -o "thread backtrace" -o quit -- "$bin" about:blank 2>&1 | tail -80
+          # lldb waits forever on a hang, and `timeout` is not on macOS; perl's
+          # alarm is.
+          perl -e 'alarm 150; exec @ARGV' lldb -b \
+            -o "settings set target.env-vars CINDER_WINDOW_SELFTEST=8 CINDER_NO_UPDATE_CHECK=1" \
+            -o run -o "thread backtrace" -o quit -- "$bin" about:blank 2>&1 | tail -80 || true
 
       # A SIGTRAP inside Chromium leaves no log line, but macOS writes a crash
       # report. Print the newest ones so the faulting frame is in the job log.

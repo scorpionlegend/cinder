@@ -20,6 +20,7 @@ mod ffi {
 
     extern "C" {
         pub fn cinder_cef_execute_process(argc: c_int, argv: *mut *mut c_char) -> c_int;
+        pub fn cinder_cef_add_switch(switch_text: *const c_char);
         pub fn cinder_cef_init_ex(
             argc: c_int,
             argv: *mut *mut c_char,
@@ -258,6 +259,17 @@ impl Cef {
         let resources = cstr_arg(&resources_dir.to_string_lossy(), "resources dir")?;
         let locales = cstr_arg(&locales_dir.to_string_lossy(), "locales dir")?;
         let cache = cstr_arg(&cache_dir.to_string_lossy(), "cache dir")?;
+
+        // Chromium reads its switches from the process command line, which on
+        // Windows is not `argv`. Hand them to the app hook as well so they take
+        // effect on every platform.
+        for arg in extra_args {
+            let name = arg.strip_prefix("--").unwrap_or(arg);
+            if let Ok(text) = CString::new(name) {
+                // SAFETY: NUL-terminated string, copied by the shim.
+                unsafe { ffi::cinder_cef_add_switch(text.as_ptr()) };
+            }
+        }
 
         // SAFETY: all pointers are valid for the duration of the call; argv
         // outlives it.

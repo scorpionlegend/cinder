@@ -126,9 +126,11 @@ pub fn run(
     // when the session is Wayland; XWayland provides the display.
     #[cfg(target_os = "linux")]
     builder.with_x11();
+    trace("event loop building");
     let event_loop = builder
         .build()
         .map_err(|e| WindowError::EventLoop(e.to_string()))?;
+    trace("event loop built");
     event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + TICK));
     let mut app = Shell {
         engine,
@@ -152,6 +154,7 @@ pub fn run(
             .and_then(|v| v.parse().ok())
             .unwrap_or(0),
     };
+    trace("event loop running");
     event_loop
         .run_app(&mut app)
         .map_err(|e| WindowError::EventLoop(e.to_string()))
@@ -313,6 +316,7 @@ impl ApplicationHandler for Shell {
         if self.window.is_some() {
             return;
         }
+        trace("resumed enter");
         let attrs = Window::default_attributes()
             .with_title(self.options.title.clone())
             .with_inner_size(winit::dpi::LogicalSize::new(
@@ -335,6 +339,7 @@ impl ApplicationHandler for Shell {
                 return;
             }
         };
+        trace("window created");
         let surface = match softbuffer::Surface::new(&context, window.clone()) {
             Ok(s) => s,
             Err(e) => {
@@ -343,6 +348,7 @@ impl ApplicationHandler for Shell {
                 return;
             }
         };
+        trace("surface ready");
         let size = window.inner_size();
         let scale = window.scale_factor() as f32;
         // CEF's windowed mode embeds a child window, so the shell has to hand
