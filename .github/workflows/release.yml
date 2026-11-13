@@ -204,8 +204,7 @@ jobs:
             tout=$(cat "$RUNNER_TEMP/selftest-timer.out")
             echo "$tout"
             echo "timer exit code: $tcode"
-            out="$out
-$tout"
+            printf -v out '%s\n%s' "$out" "$tout"
           fi
           if ! grep -q "window selftest: .*view=view-" <<<"$out"; then
             echo "::warning::the window never got a page view (exit $code)"
