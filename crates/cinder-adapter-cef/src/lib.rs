@@ -65,6 +65,8 @@ pub const EV_CLOSED: i32 = 7;
 pub const EV_CLOSE_REQUESTED: i32 = 8;
 pub const EV_PAINTED: i32 = 9;
 pub const EV_BLOCKED: i32 = 10;
+pub const EV_DOWNLOAD: i32 = 11;
+pub const EV_DOWNLOAD_UPDATED: i32 = 12;
 
 mod engine;
 mod runtime;

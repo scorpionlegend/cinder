@@ -682,15 +682,42 @@ fn run_browse(target: Option<&str>) -> i32 {
     // profile waits for Chromium's network service, so allow a generous window.
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     let mut settled = false;
+    let mut downloading = false;
+    // A download starts after the navigation it aborts has already finished, so
+    // a settled load is only the end of the work once a short grace period
+    // passes without a download appearing.
+    let mut idle = 0u32;
     while std::time::Instant::now() < deadline {
         for effect in browser.pump() {
             println!("  {}", describe(&effect));
-            if matches!(
-                effect,
-                Effect::LoadFinished { .. } | Effect::LoadFailed { .. }
-            ) {
-                settled = true;
+            match effect {
+                Effect::DownloadStarted { .. } => {
+                    downloading = true;
+                    settled = false;
+                    idle = 0;
+                }
+                Effect::LoadFinished { .. } | Effect::LoadFailed { .. } => {
+                    settled = !downloading;
+                }
+                Effect::DownloadProgress {
+                    done,
+                    canceled,
+                    interrupted,
+                    ..
+                } if done || canceled || interrupted => {
+                    downloading = false;
+                    settled = true;
+                }
+                _ => {}
             }
+        }
+        if settled {
+            idle += 1;
+            if idle >= 50 {
+                break;
+            }
+        } else {
+            idle = 0;
         }
         if settled {
             break;
@@ -988,6 +1015,21 @@ fn run_open(target: Option<&str>) -> i32 {    use std::cell::RefCell;
                     }
                 }
                 Effect::LoadFailed { reason, .. } => println!("  load failed ({reason:?})"),
+                Effect::DownloadStarted { url, name, .. } => {
+                    println!("  download started: {name} from {url}")
+                }
+                Effect::DownloadProgress {
+                    path,
+                    percent,
+                    done,
+                    canceled,
+                    interrupted,
+                    ..
+                } => {
+                    if done || canceled || interrupted {
+                        println!("  download finished: {path} ({percent}%)");
+                    }
+                }
                 Effect::EngineFault { message } => eprintln!("  engine fault: {message}"),
                 other => {
                     if debug {
@@ -1104,6 +1146,27 @@ fn describe(effect: &Effect) -> String {    match effect {
             format!("{tab} asks for {kind} on {origin}")
         }
         Effect::DecisionRequired { tab, kind } => format!("{tab} needs a {kind} decision"),
+        Effect::DownloadStarted { tab, name, .. } => format!("{tab} downloading {name}"),
+        Effect::DownloadProgress {
+            tab,
+            path,
+            percent,
+            done,
+            canceled,
+            interrupted,
+        } => {
+            let state = if *canceled {
+                "canceled"
+            } else if *interrupted {
+                "interrupted"
+            } else if *done {
+                "done"
+            } else {
+                "downloading"
+            };
+            let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+            format!("{tab} {name} {percent}% {state}")
+        }
         Effect::EngineFault { message } => format!("engine fault: {message}"),
         Effect::ShutdownComplete => "engine shutdown complete".to_string(),
     }

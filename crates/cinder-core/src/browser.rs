@@ -38,6 +38,17 @@ pub enum Effect {
         origin: String,
     },
     DecisionRequired { tab: TabId, kind: &'static str },
+    /// A download began; `name` is the suggested file name.
+    DownloadStarted { tab: TabId, url: String, name: String },
+    /// A download moved on: `percent` 0-100, `path` empty until known.
+    DownloadProgress {
+        tab: TabId,
+        path: String,
+        percent: u8,
+        done: bool,
+        canceled: bool,
+        interrupted: bool,
+    },
     EngineFault { message: String },
     ShutdownComplete,
 }
@@ -428,6 +439,34 @@ impl Browser {
             Event::ViewUnresponsive { .. } => {
                 if let Some(tab) = tab_id {
                     effects.push(Effect::ViewUnresponsive { tab });
+                }
+            }
+            Event::DownloadStarted { url, name, .. } => {
+                if let Some(tab) = tab_id {
+                    effects.push(Effect::DownloadStarted {
+                        tab,
+                        url: url.as_str().to_string(),
+                        name,
+                    });
+                }
+            }
+            Event::DownloadProgress {
+                path,
+                percent,
+                done,
+                canceled,
+                interrupted,
+                ..
+            } => {
+                if let Some(tab) = tab_id {
+                    effects.push(Effect::DownloadProgress {
+                        tab,
+                        path,
+                        percent,
+                        done,
+                        canceled,
+                        interrupted,
+                    });
                 }
             }
             Event::GpuProcessFailed => effects.push(Effect::EngineFault {

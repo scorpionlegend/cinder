@@ -524,6 +524,39 @@ extern "C" fn on_cef_event(
                     },
                 );
             }
+            crate::EV_DOWNLOAD => {
+                if let Ok(url) = Url::parse(&text(a)) {
+                    sink.emit(
+                        Some(view),
+                        Event::DownloadStarted {
+                            view,
+                            url,
+                            name: text(b),
+                        },
+                    );
+                }
+            }
+            crate::EV_DOWNLOAD_UPDATED => {
+                let state = text(b);
+                let mut parts = state.split(':');
+                let percent = parts
+                    .next()
+                    .and_then(|p| p.parse::<i32>().ok())
+                    .unwrap_or(0)
+                    .clamp(0, 100) as u8;
+                let flag = |p: Option<&str>| p == Some("1");
+                sink.emit(
+                    Some(view),
+                    Event::DownloadProgress {
+                        view,
+                        path: text(a),
+                        percent,
+                        done: flag(parts.next()),
+                        canceled: flag(parts.next()),
+                        interrupted: flag(parts.next()),
+                    },
+                );
+            }
             crate::EV_CLOSE_REQUESTED => {
                 sink.emit(Some(view), Event::CloseRequested { view });
             }

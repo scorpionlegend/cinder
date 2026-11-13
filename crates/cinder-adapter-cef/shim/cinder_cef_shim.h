@@ -45,6 +45,8 @@ int cinder_cef_init_ex(int argc, char** argv, const char* resources_dir,
 #define CINDER_CEF_EV_CLOSE_REQUESTED 8  /* -                                    */
 #define CINDER_CEF_EV_PAINTED 9          /* -                                    */
 #define CINDER_CEF_EV_BLOCKED 10         /* a = url cancelled by policy          */
+#define CINDER_CEF_EV_DOWNLOAD 11        /* a = url, b = suggested file name     */
+#define CINDER_CEF_EV_DOWNLOAD_UPDATED 12 /* a = path, b = "pct:done:cancel:err" */
 
 typedef void (*cinder_cef_event_fn)(void* user_data, int view_id, int kind,
                                     const char* a, const char* b);

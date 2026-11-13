@@ -110,6 +110,21 @@ pub enum Event {
         view: ViewId,
         cause: CrashCause,
     },
+    /// A download began; `name` is the suggested file name.
+    DownloadStarted {
+        view: ViewId,
+        url: Url,
+        name: String,
+    },
+    /// A download moved on. `path` is empty until Chromium knows it.
+    DownloadProgress {
+        view: ViewId,
+        path: String,
+        percent: u8,
+        done: bool,
+        canceled: bool,
+        interrupted: bool,
+    },
     ViewUnresponsive {
         view: ViewId,
     },
@@ -151,6 +166,8 @@ impl Event {
             | Self::SecurityStateChanged { view, .. }
             | Self::AudioStateChanged { view, .. }
             | Self::RendererTerminated { view, .. }
+            | Self::DownloadStarted { view, .. }
+            | Self::DownloadProgress { view, .. }
             | Self::ViewUnresponsive { view } => Some(*view),
             Self::EventsDropped { view, .. } => *view,
             Self::EngineInitialized { .. }
@@ -181,6 +198,8 @@ impl Event {
             Self::SecurityStateChanged { .. } => "security_state_changed",
             Self::AudioStateChanged { .. } => "audio_state_changed",
             Self::RendererTerminated { .. } => "renderer_terminated",
+            Self::DownloadStarted { .. } => "download_started",
+            Self::DownloadProgress { .. } => "download_progress",
             Self::ViewUnresponsive { .. } => "view_unresponsive",
             Self::GpuProcessFailed => "gpu_process_failed",
             Self::EngineFatal { .. } => "engine_fatal",

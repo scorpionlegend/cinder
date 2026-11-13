@@ -36,6 +36,8 @@
 #include "include/capi/cef_browser_capi.h"
 #include "include/capi/cef_client_capi.h"
 #include "include/capi/cef_display_handler_capi.h"
+#include "include/capi/cef_download_handler_capi.h"
+#include "include/capi/cef_download_item_capi.h"
 #include "include/capi/cef_life_span_handler_capi.h"
 #include "include/capi/cef_load_handler_capi.h"
 #include "include/capi/cef_render_handler_capi.h"
@@ -178,6 +180,7 @@ static int g_load_refs = 1;
 static int g_display_refs = 1;
 static int g_request_refs = 1;
 static int g_resource_refs = 1;
+static int g_download_refs = 1;
 
 DEFINE_REFCOUNT(app, g_app_refs)
 DEFINE_REFCOUNT(client, g_client_refs)
@@ -187,6 +190,7 @@ DEFINE_REFCOUNT(load, g_load_refs)
 DEFINE_REFCOUNT(display, g_display_refs)
 DEFINE_REFCOUNT(request, g_request_refs)
 DEFINE_REFCOUNT(resource, g_resource_refs)
+DEFINE_REFCOUNT(download, g_download_refs)
 
 /* --------------------------------------------------------------- strings --- */
 
@@ -756,6 +760,97 @@ static struct _cef_display_handler_t* CEF_CALLBACK client_get_display_handler(
   return &g_display_handler;
 }
 
+/* ------------------------------------------------------------ downloads --- */
+
+/* Chromium hands the shell a download, the shell reports it and lets Chromium
+ * pick the directory. There is no Save As dialog: a shell without one cannot
+ * show it, and an empty path keeps the default handling. */
+
+static int CEF_CALLBACK download_can_download(
+    struct _cef_download_handler_t* self, struct _cef_browser_t* browser,
+    const cef_string_t* url, const cef_string_t* request_method) {
+  (void)self;
+  (void)browser;
+  (void)url;
+  (void)request_method;
+  trace("download can_download", 1, 0);
+  return 1;
+}
+
+static int CEF_CALLBACK download_on_before_download(
+    struct _cef_download_handler_t* self, struct _cef_browser_t* browser,
+    struct _cef_download_item_t* download_item,
+    const cef_string_t* suggested_name,
+    struct _cef_before_download_callback_t* callback) {
+  char name[512];
+  char url[2048];
+  cef_string_userfree_t url_free;
+  (void)self;
+  to_utf8(suggested_name, name, sizeof(name));
+  url[0] = '\0';
+  if (download_item) {
+    url_free = download_item->get_url(download_item);
+    if (url_free) {
+      to_utf8(url_free, url, sizeof(url));
+      cef_string_userfree_utf16_free(url_free);
+    }
+  }
+  emit(view_id_by_browser(browser), CINDER_CEF_EV_DOWNLOAD, url, name);
+  trace("download before", (long)view_id_by_browser(browser), (long)strlen(name));
+  if (callback) {
+    callback->cont(callback, NULL, 0);
+  }
+  return 1;
+}
+
+static void CEF_CALLBACK download_on_download_updated(
+    struct _cef_download_handler_t* self, struct _cef_browser_t* browser,
+    struct _cef_download_item_t* download_item,
+    struct _cef_download_item_callback_t* callback) {
+  char path[2048];
+  char state[64];
+  cef_string_userfree_t path_free;
+  int percent;
+  int complete;
+  int canceled;
+  int interrupted;
+  (void)self;
+  (void)callback;
+  if (!download_item) {
+    return;
+  }
+  percent = download_item->get_percent_complete(download_item);
+  complete = download_item->is_complete(download_item);
+  canceled = download_item->is_canceled(download_item);
+  interrupted = download_item->is_interrupted(download_item);
+  path[0] = '\0';
+  path_free = download_item->get_full_path(download_item);
+  if (path_free) {
+    to_utf8(path_free, path, sizeof(path));
+    cef_string_userfree_utf16_free(path_free);
+  }
+  snprintf(state, sizeof(state), "%d:%d:%d:%d", percent, complete, canceled,
+           interrupted);
+  emit(view_id_by_browser(browser), CINDER_CEF_EV_DOWNLOAD_UPDATED, path, state);
+}
+
+static cef_download_handler_t g_download_handler = {
+    .base = {.size = sizeof(cef_download_handler_t),
+             .add_ref = download_add_ref,
+             .release = download_release,
+             .has_one_ref = download_has_one_ref,
+             .has_at_least_one_ref = download_has_at_least_one_ref},
+    .can_download = download_can_download,
+    .on_before_download = download_on_before_download,
+    .on_download_updated = download_on_download_updated,
+};
+
+static struct _cef_download_handler_t* CEF_CALLBACK client_get_download_handler(
+    struct _cef_client_t* self) {
+  (void)self;
+  return &g_download_handler;
+}
+
 static struct _cef_request_handler_t* CEF_CALLBACK client_get_request_handler(
     struct _cef_client_t* self) {
   (void)self;
@@ -769,6 +864,7 @@ static cef_client_t g_client = {
              .has_one_ref = client_has_one_ref,
              .has_at_least_one_ref = client_has_at_least_one_ref},
     .get_display_handler = client_get_display_handler,
+    .get_download_handler = client_get_download_handler,
     .get_life_span_handler = client_get_life_span_handler,
     .get_load_handler = client_get_load_handler,
     .get_render_handler = client_get_render_handler,
