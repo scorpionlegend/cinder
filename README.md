@@ -12,9 +12,10 @@ typed adapter boundary.
 
 Early implementation. The typed adapter, the orchestrator, the mock engine and
 the CEF-backed adapter (L0/L1) exist, and the CEF off-screen render spike passes.
-**There is no browser window yet**: no windowing layer, no chrome UI, no tab
-strip, so nothing here is a usable browser. What exists is the boundary and the
-Cinder-side model that carry forward unchanged once the window layer lands.
+`cinder` opens a real window: a toolbar with back, forward, reload and an address
+field, and the page itself is a native CEF child window, so Chromium paints and
+handles input directly. Still missing: tabs, bookmarks, downloads, settings and
+the full Chrome-style chrome.
 
 | Crate | Role |
 | --- | --- |

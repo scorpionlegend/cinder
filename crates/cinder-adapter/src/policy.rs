@@ -98,7 +98,11 @@ impl PolicySnapshot {
                 return RequestDecision::Block;
             }
         }
-        if self.https_upgrade && url.scheme() == "http" {
+        // Local development servers rarely speak TLS, and upgrading them turns
+        // a working page into a handshake failure. Browsers exempt loopback for
+        // the same reason.
+        if self.https_upgrade && url.scheme() == "http" && !url.host().is_some_and(|h| is_loopback(&h))
+        {
             return RequestDecision::UpgradeToHttps;
         }
         RequestDecision::Allow
@@ -116,6 +120,18 @@ impl PolicySnapshot {
                     .find(|p| p.origin == "*" && p.kind == kind)
             })
             .map(|p| p.decision)
+    }
+}
+
+/// Whether a lowercased host names this machine, where an HTTP server is
+/// normally a local development server rather than something to upgrade.
+fn is_loopback(host: &str) -> bool {
+    if host == "localhost" || host.ends_with(".localhost") || host == "[::1]" || host == "::1" {
+        return true;
+    }
+    match host.parse::<std::net::Ipv4Addr>() {
+        Ok(ip) => ip.is_loopback(),
+        Err(_) => false,
     }
 }
 
@@ -151,6 +167,28 @@ mod tests {
         assert_eq!(
             p.decide_request(&url("https://example.com/")),
             RequestDecision::Allow
+        );
+    }
+
+    #[test]
+    fn leaves_loopback_on_plain_http() {
+        let p = PolicySnapshot::new(2).with_https_upgrade(true);
+        for host in [
+            "http://localhost:8099/",
+            "http://127.0.0.1:8099/",
+            "http://127.0.0.53/",
+            "http://[::1]:8099/",
+            "http://app.localhost/",
+        ] {
+            assert_eq!(
+                p.decide_request(&url(host)),
+                RequestDecision::Allow,
+                "{host} should not be upgraded"
+            );
+        }
+        assert_eq!(
+            p.decide_request(&url("http://192.168.1.10/")),
+            RequestDecision::UpgradeToHttps
         );
     }
 

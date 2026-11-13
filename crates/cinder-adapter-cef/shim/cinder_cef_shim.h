@@ -23,9 +23,13 @@ extern "C" {
  * is a CEF subprocess and should exit with that code immediately. */
 int cinder_cef_execute_process(int argc, char** argv);
 
-/* Initialize CEF. Returns 1 on success, 0 on failure. */
+/* Initialize CEF. Returns 1 on success, 0 on failure. `windowless` enables
+ * off-screen rendering for the whole process; a windowed shell passes 0. */
 int cinder_cef_init(int argc, char** argv, const char* resources_dir,
                     const char* locales_dir, const char* cache_dir);
+int cinder_cef_init_ex(int argc, char** argv, const char* resources_dir,
+                       const char* locales_dir, const char* cache_dir,
+                       int windowless);
 
 /* ------------------------------------------------------------- events --- */
 
@@ -51,9 +55,12 @@ void cinder_cef_set_event_callback(cinder_cef_event_fn cb, void* user_data);
 
 /* -------------------------------------------------------------- views --- */
 
-/* Create one windowless (off-screen) browser under `view_id`. Returns 1 on
- * success. Fails if the id is already used or the table is full. */
-int cinder_cef_create_view(int view_id, const char* url, int width, int height);
+/* Create one browser under `view_id`. `parent` is the shell's native window
+ * handle: zero creates a windowless (off-screen) browser, non-zero embeds a
+ * child window in that parent. Returns 1 on success. Fails if the id is already
+ * used or the table is full. */
+int cinder_cef_create_view(int view_id, const char* url, int width, int height,
+                           unsigned long long parent, int top);
 
 /* Ask a view to close. `force` skips page-level beforeunload handlers.
  * Returns 1 if the request was issued. */

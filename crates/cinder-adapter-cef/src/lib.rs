@@ -20,12 +20,13 @@ mod ffi {
 
     extern "C" {
         pub fn cinder_cef_execute_process(argc: c_int, argv: *mut *mut c_char) -> c_int;
-        pub fn cinder_cef_init(
+        pub fn cinder_cef_init_ex(
             argc: c_int,
             argv: *mut *mut c_char,
             resources_dir: *const c_char,
             locales_dir: *const c_char,
             cache_dir: *const c_char,
+            windowless: c_int,
         ) -> c_int;
         pub fn cinder_cef_create_browser(
             url: *const c_char,
@@ -206,6 +207,19 @@ impl Cef {
         cache_dir: &Path,
         extra_args: &[String],
     ) -> Result<Self, CefError> {
+        Self::init_with_args_mode(resources_dir, locales_dir, cache_dir, extra_args, true)
+    }
+
+    /// As [`Cef::init_with_args`], but chooses the process-wide rendering mode.
+    /// A windowed shell passes `false`: CEF then creates native child windows
+    /// instead of painting off-screen.
+    pub fn init_with_args_mode(
+        resources_dir: &Path,
+        locales_dir: &Path,
+        cache_dir: &Path,
+        extra_args: &[String],
+        windowless: bool,
+    ) -> Result<Self, CefError> {
         let mut args = std::env::args().collect::<Vec<_>>();
         args.extend(extra_args.iter().cloned());
         let mut owned: Vec<CString> = args
@@ -225,12 +239,13 @@ impl Cef {
         // SAFETY: all pointers are valid for the duration of the call; argv
         // outlives it.
         let ok = unsafe {
-            ffi::cinder_cef_init(
+            ffi::cinder_cef_init_ex(
                 argc,
                 ptrs.as_mut_ptr(),
                 resources.as_ptr(),
                 locales.as_ptr(),
                 cache.as_ptr(),
+                windowless as c_int,
             )
         };
         if ok == 1 {

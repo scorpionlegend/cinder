@@ -354,6 +354,7 @@ fn run_browse(target: Option<&str>) -> i32 {
             "--disable-dev-shm-usage".into(),
             "--ozone-platform=headless".into(),
         ],
+        windowless: true,
         capabilities: cinder_adapter_cef::measured_capabilities(),
     };
     println!("web engine : CEF {}", cinder_adapter_cef::Cef::version());
@@ -441,15 +442,14 @@ fn run_browse(_target: Option<&str>) -> i32 {
 }
 
 #[cfg(feature = "window")]
-/// Chromium switches for the windowed path. `CINDER_CEF_ARGS` overrides them so
-/// a flag combination can be tried without a rebuild.
+/// Chromium switches for the windowed path.
 fn window_args() -> Vec<String> {
-    if let Ok(raw) = std::env::var("CINDER_CEF_ARGS") {
-        return raw.split_whitespace().map(str::to_string).collect();
-    }
     vec![
+        // The shell is an X11 window (XWayland under a Wayland session) and CEF
+        // embeds an X11 child in it, so Chromium must not pick the Wayland
+        // backend.
+        "--ozone-platform=x11".into(),
         "--disable-gpu".into(),
-        "--disable-gpu-compositing".into(),
         "--disable-dev-shm-usage".into(),
     ]
 }
@@ -480,6 +480,7 @@ fn run_open(target: Option<&str>) -> i32 {
         // winit, not to Chromium. The software rasterizer must stay enabled:
         // disabling it leaves every frame black.
         extra_args: window_args(),
+        windowless: false,
         capabilities: cinder_adapter_cef::measured_capabilities(),
     };
 
@@ -492,7 +493,7 @@ fn run_open(target: Option<&str>) -> i32 {
     };
 
     let policy = Arc::new(PolicySnapshot::new(1).with_https_upgrade(true));
-    let mut browser = match Browser::new(engine.clone(), policy, "/tmp/cinder-window-profile") {
+    let browser = match Browser::new(engine.clone(), policy, "/tmp/cinder-window-profile") {
         Ok(b) => b,
         Err(e) => {
             eprintln!("failed to start orchestrator: {e}");
@@ -500,30 +501,16 @@ fn run_open(target: Option<&str>) -> i32 {
         }
     };
 
-    let window = browser.open_window();
-    let tab = match browser.open_tab(window, Some(url.clone())) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("could not open tab: {e}");
-            return 1;
-        }
-    };
-    println!("web engine : CEF {}", cinder_adapter_cef::Cef::version());
-    println!("tab        : {tab} -> {}", url.as_str());
-
-    let Some(view) = browser.tab(tab).map(|t| t.view) else {
-        eprintln!("tab {tab} has no view");
-        return 1;
-    };
-
     // The window loop owns the main thread and the orchestrator stays on it, so
-    // a plain `Rc<RefCell<_>>` is enough; no locking is needed.
+    // a plain `Rc<RefCell<_>>` is enough; no locking is needed. The page is
+    // created from inside the loop because its child window needs the shell's
+    // native handle, which only exists once the window does.
     let shared = Rc::new(RefCell::new(browser));
     let pump = Rc::clone(&shared);
+    let opener = Rc::clone(&shared);
     let probe = Arc::clone(&engine);
     let debug = std::env::var_os("CINDER_WINDOW_SELFTEST").is_some();
     let mut ticks = 0u32;
-
     // The update check runs on its own thread: the window must never wait for
     // the network, and the answer only changes the status strip.
     let status = Arc::new(std::sync::Mutex::new(String::new()));
@@ -549,7 +536,34 @@ fn run_open(target: Option<&str>) -> i32 {
         title: "Cinder".to_string(),
         ..Default::default()
     };
-    let result = cinder_window::run(engine.clone(), view, options, ui, move || {
+    let result = cinder_window::run(
+        engine.clone(),
+        options,
+        ui,
+        move |parent| {
+            use cinder_adapter::command::Surface;
+            let mut browser = opener.borrow_mut();
+            browser.set_surface(Surface::NativeChild {
+                parent: parent.handle,
+                top: parent.top,
+                width: parent.width,
+                height: parent.height,
+                scale: parent.scale,
+            });
+            let window = browser.open_window();
+            match browser.open_tab(window, Some(url.clone())) {
+                Ok(tab) => {
+                    println!("web engine : CEF {}", cinder_adapter_cef::Cef::version());
+                    println!("tab        : {tab} -> {}", url.as_str());
+                    browser.tab(tab).map(|t| t.view)
+                }
+                Err(e) => {
+                    eprintln!("could not open tab: {e}");
+                    None
+                }
+            }
+        },
+        move || {
         let mut browser = pump.borrow_mut();
         for effect in browser.pump() {
             match effect {
@@ -566,7 +580,8 @@ fn run_open(target: Option<&str>) -> i32 {
         }
         ticks += 1;
         if debug && ticks % 60 == 0 {
-            let frame = probe.copy_frame(view);
+            let view = browser.tabs().next().map(|t| t.view);
+            let frame = view.and_then(|v| probe.copy_frame(v));
             println!(
                 "  tick {ticks}: frame={:?}",
                 frame.map(|f| (f.width, f.height))
@@ -618,7 +633,8 @@ fn run_open(target: Option<&str>) -> i32 {
                 *slot = notice.clone();
             }
         }
-    });
+        },
+    );
 
     let mut browser = shared.borrow_mut();
     let shutdown = browser.shutdown(Duration::from_secs(5));

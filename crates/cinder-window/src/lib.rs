@@ -1,13 +1,11 @@
-//! The window layer: an OS window that shows CEF's off-screen frames and
-//! replays OS input back into the page.
+//! The window layer: an OS window whose page area is a native child window
+//! owned by CEF.
 //!
-//! CEF runs windowless here, so it never owns a native view and never sees an
-//! OS event. Two consequences shape this crate:
-//!
-//!  * Pixels are pulled, not pushed. Each redraw copies the last painted frame
-//!    out of the shim and blits it into the window's buffer.
-//!  * Input is replayed. Every key, click and scroll is translated into the
-//!    matching `InputEvent` and handed back to the engine thread.
+//! CEF runs in windowed mode here. It creates a child window inside the shell's
+//! window and paints into it directly, so the shell never copies pixels and
+//! never replays input: the compositor and the X server deliver both. The shell
+//! owns only the toolbar, the address field and the status strip, which it draws
+//! into the part of the window the child does not cover.
 //!
 //! The event loop stays on the main thread, which is what winit requires; the
 //! engine keeps its own thread and is reached only through channels.
@@ -24,12 +22,14 @@ use cinder_adapter::command::Command;
 use cinder_adapter::engine::Engine;
 use cinder_adapter::ids::ViewId;
 use cinder_adapter::sanitize::Url;
-use cinder_adapter_cef::{CefEngine, InputEvent, KeyKind, MouseButton};
+use cinder_adapter_cef::CefEngine;
 use chrome::{Chrome, Edit, Hit};
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, MouseButton as WinitButton, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
+use winit::platform::x11::EventLoopBuilderExtX11;
+use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::{Window, WindowId};
 
 /// How often the loop wakes to pump the engine and repaint.
@@ -85,20 +85,44 @@ pub struct Ui {
     pub clicked: Option<Sender<()>>,
 }
 
-/// Run the window until the user closes it. `tick` is called once per frame so
-/// the caller can pump the orchestrator and react to effects.
+/// The shell's native window, handed to the engine so it can embed the page.
+#[derive(Debug, Clone, Copy)]
+pub struct NativeParent {
+    /// Platform handle: an X11 window id on Linux, an `HWND` on Windows, an
+    /// `NSView` pointer on macOS.
+    pub handle: u64,
+    /// Size of the area the page occupies, below the toolbar and above the
+    /// status strip.
+    pub top: u32,
+    pub width: u32,
+    pub height: u32,
+    pub scale: f32,
+}
+
+/// Run the window until the user closes it.
+///
+/// `open` is called once the window exists, with the handle the engine needs to
+/// create the page's child window; it returns the view to drive. `tick` is
+/// called once per frame so the caller can pump the orchestrator.
 pub fn run(
     engine: Arc<CefEngine>,
-    view: ViewId,
     options: WindowOptions,
     ui: Ui,
+    open: impl FnOnce(NativeParent) -> Option<ViewId> + 'static,
     tick: impl FnMut() + 'static,
 ) -> Result<(), WindowError> {
-    let event_loop = EventLoop::new().map_err(|e| WindowError::EventLoop(e.to_string()))?;
+    let mut builder = EventLoop::builder();
+    // CEF embeds an X11 child window, so the shell must be an X11 window even
+    // when the session is Wayland; XWayland provides the display.
+    builder.with_x11();
+    let event_loop = builder
+        .build()
+        .map_err(|e| WindowError::EventLoop(e.to_string()))?;
     event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + TICK));
     let mut app = Shell {
         engine,
-        view,
+        view: None,
+        open: Some(Box::new(open)),
         options,
         ui,
         tick: Box::new(tick),
@@ -106,15 +130,11 @@ pub fn run(
         surface: None,
         context: None,
         chrome: Chrome::new(1.0),
-        in_chrome: false,
         modifiers: ModifiersState::empty(),
         cursor: (0.0, 0.0),
         last_size: (0, 0),
         ticks: 0,
         presented: 0,
-        last_frame: None,
-        last_hist: None,
-        content: false,
         last_reason: "none",
         selftest: std::env::var("CINDER_WINDOW_SELFTEST")
             .ok()
@@ -128,7 +148,9 @@ pub fn run(
 
 struct Shell {
     engine: Arc<CefEngine>,
-    view: ViewId,
+    /// Set once the window exists and `open` has created the page.
+    view: Option<ViewId>,
+    open: Option<Box<dyn FnOnce(NativeParent) -> Option<ViewId>>>,
     options: WindowOptions,
     ui: Ui,
     tick: Box<dyn FnMut()>,
@@ -137,18 +159,11 @@ struct Shell {
     surface: Option<softbuffer::Surface<Arc<Window>, Arc<Window>>>,
     /// Toolbar, address field and status strip.
     chrome: Chrome,
-    /// True while the pointer is over the chrome rather than the page.
-    in_chrome: bool,
     modifiers: ModifiersState,
     cursor: (f64, f64),
     last_size: (u32, u32),
     ticks: u32,
     presented: u32,
-    last_frame: Option<(u32, u32, usize)>,
-    /// The most common colours in the last frame, for the selftest report.
-    last_hist: Option<String>,
-    /// Set once a frame arrives that is neither blank nor uniform.
-    content: bool,
     /// Why the last redraw did or did not present, for the selftest report.
     last_reason: &'static str,
     /// Set by `CINDER_WINDOW_SELFTEST`: run for a bounded number of frames and
@@ -159,6 +174,9 @@ struct Shell {
 
 impl Shell {
     fn resize_view(&mut self, width: u32, height: u32, scale: f32) {
+        let Some(view) = self.view else {
+            return;
+        };
         if width == 0 || height == 0 || (width, height) == self.last_size {
             return;
         }
@@ -169,24 +187,10 @@ impl Shell {
             .saturating_sub(self.chrome.status_px())
             .max(1);
         let _ = self.engine.execute(Command::Resize {
-            view: self.view,
+            view,
             width,
             height: view_height,
             scale,
-        });
-    }
-
-    fn input(&self, event: InputEvent) {
-        self.engine.send_input(self.view, event);
-    }
-
-    /// Tell the page the pointer left it, once, when it moves into the chrome.
-    fn page_leave(&self) {
-        self.input(InputEvent::MouseMove {
-            x: self.cursor.0 as i32,
-            y: (self.cursor.1 - self.chrome.toolbar_px() as f64) as i32,
-            modifiers: self.modifiers(),
-            leave: true,
         });
     }
 
@@ -215,10 +219,12 @@ impl Shell {
             Hit::Reload => self.reload(),
             Hit::Url => {
                 self.chrome.begin_edit();
-                let _ = self.engine.execute(Command::SetFocus {
-                    view: self.view,
-                    focused: false,
-                });
+                if let Some(view) = self.view {
+                    let _ = self.engine.execute(Command::SetFocus {
+                        view,
+                        focused: false,
+                    });
+                }
             }
             Hit::Status => {
                 if let Some(clicked) = self.ui.clicked.as_ref() {
@@ -229,18 +235,24 @@ impl Shell {
     }
 
     fn back(&mut self) {
-        let _ = self.engine.execute(Command::GoBack { view: self.view });
+        if let Some(view) = self.view {
+            let _ = self.engine.execute(Command::GoBack { view });
+        }
     }
 
     fn forward(&mut self) {
-        let _ = self.engine.execute(Command::GoForward { view: self.view });
+        if let Some(view) = self.view {
+            let _ = self.engine.execute(Command::GoForward { view });
+        }
     }
 
     fn reload(&mut self) {
-        let _ = self.engine.execute(Command::Reload {
-            view: self.view,
-            bypass_cache: false,
-        });
+        if let Some(view) = self.view {
+            let _ = self.engine.execute(Command::Reload {
+                view,
+                bypass_cache: false,
+            });
+        }
     }
 
     /// Navigate to whatever the address field holds.
@@ -249,16 +261,18 @@ impl Shell {
             return;
         };
         self.chrome.cancel_edit();
+        let Some(view) = self.view else {
+            return;
+        };
         let _ = self.engine.execute(Command::SetFocus {
-            view: self.view,
+            view,
             focused: true,
         });
-        let _ = self.engine.execute(Command::Navigate {
-            view: self.view,
-            url,
-        });
+        let _ = self.engine.execute(Command::Navigate { view, url });
     }
 
+    /// Repaint the chrome. The page area belongs to CEF's child window, so this
+    /// only has to cover the toolbar and the status strip.
     fn present(&mut self) -> &'static str {
         let (Some(surface), Some(window)) = (self.surface.as_mut(), self.window.as_ref()) else {
             return "no surface";
@@ -267,80 +281,19 @@ impl Shell {
         let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) else {
             return "zero size";
         };
-        let Some(frame) = self.engine.copy_frame(self.view) else {
-            return "no frame";
-        };
         if surface.resize(w, h).is_err() {
             return "resize failed";
         }
         let Ok(mut buffer) = surface.buffer_mut() else {
             return "buffer failed";
         };
-        let width = w.get() as usize;
-        let height = h.get() as usize;
-        let top = self.chrome.toolbar_px() as usize;
-        let bottom = height.saturating_sub(self.chrome.status_px() as usize);
         buffer.fill(0x00ff_ffff);
-        // The frame is BGRA and the buffer is 0x00RRGGBB, so the channels swap
-        // and alpha is dropped: CEF always paints opaque. It lands below the
-        // toolbar and above the status strip.
-        let stride = frame.width as usize * 4;
-        let cols = (frame.width as usize).min(width);
-        let rows = (frame.height as usize).min(bottom.saturating_sub(top));
-        for y in 0..rows {
-            let src = &frame.bgra[y * stride..y * stride + cols * 4];
-            let base = (top + y) * width;
-            let dst = &mut buffer[base..base + cols];
-            for (out, px) in dst.iter_mut().zip(src.chunks_exact(4)) {
-                *out = ((px[2] as u32) << 16) | ((px[1] as u32) << 8) | px[0] as u32;
-            }
-        }
         self.chrome.draw(&mut buffer, w.get(), h.get());
-        let presented = buffer.present();
-        if presented.is_err() {
+        if buffer.present().is_err() {
             return "present failed";
         }
         self.presented += 1;
-        let non_white = frame
-            .bgra
-            .chunks_exact(4)
-            .filter(|p| !(p[0] >= 250 && p[1] >= 250 && p[2] >= 250))
-            .count();
-        self.last_frame = Some((frame.width, frame.height, non_white));
-        let total = frame.width as usize * frame.height as usize;
-        if non_white > 0 && non_white < total {
-            self.content = true;
-        }
-        if self.selftest != 0 && self.ticks + 1 >= self.selftest {
-            self.last_hist = Some(histogram(&frame.bgra));
-        }
-        if let Some(path) = std::env::var_os("CINDER_WINDOW_DUMP") {
-            if self.presented % 60 == 0 {
-                let _ = std::fs::write(&path, &frame.bgra);
-                println!(
-                    "window dump: {}x{} non_white={} -> {}",
-                    frame.width,
-                    frame.height,
-                    non_white,
-                    std::path::Path::new(&path).display()
-                );
-            }
-        }
         "ok"
-    }
-
-    fn modifiers(&self) -> u32 {
-        let mut flags = 0u32;
-        if self.modifiers.shift_key() {
-            flags |= 1 << 1;
-        }
-        if self.modifiers.control_key() {
-            flags |= 1 << 2;
-        }
-        if self.modifiers.alt_key() {
-            flags |= 1 << 3;
-        }
-        flags
     }
 }
 
@@ -381,11 +334,45 @@ impl ApplicationHandler for Shell {
         };
         let size = window.inner_size();
         let scale = window.scale_factor() as f32;
-        self.resize_view(size.width, size.height, scale);
-        // Windowless views start hidden; without an explicit show the
-        // compositor never produces a frame.
+        let handle = match window.window_handle().map(|h| h.as_raw()) {
+            Ok(RawWindowHandle::Xlib(h)) => h.window,
+            Ok(RawWindowHandle::Xcb(h)) => h.window.get() as u64,
+            Ok(other) => {
+                eprintln!("cinder: unsupported window handle: {other:?}");
+                event_loop.exit();
+                return;
+            }
+            Err(e) => {
+                eprintln!("cinder: no window handle: {e}");
+                event_loop.exit();
+                return;
+            }
+        };
+        let view_height = size
+            .height
+            .saturating_sub(self.chrome.toolbar_px())
+            .saturating_sub(self.chrome.status_px())
+            .max(1);
+        let parent = NativeParent {
+            handle,
+            top: self.chrome.toolbar_px(),
+            width: size.width.max(1),
+            height: view_height,
+            scale,
+        };
+        let view = self.open.take().and_then(|open| open(parent));
+        let Some(view) = view else {
+            eprintln!("cinder: could not create the page");
+            event_loop.exit();
+            return;
+        };
+        self.view = Some(view);
+        self.last_size = (size.width, size.height);
+        self.chrome.scale = scale;
+        // A windowed browser is visible as soon as it is created; this only
+        // makes the intent explicit and is harmless if CEF already showed it.
         let _ = self.engine.execute(Command::SetVisible {
-            view: self.view,
+            view,
             visible: true,
         });
         self.window = Some(window);
@@ -413,76 +400,27 @@ impl ApplicationHandler for Shell {
                 self.last_reason = self.present();
             }
             WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
-            WindowEvent::Focused(focused) => {
-                let _ = self.engine.execute(Command::SetFocus {
-                    view: self.view,
-                    focused,
-                });
+            WindowEvent::Focused(_) => {
+                // CEF's child window owns focus for the page; the shell does not
+                // forward focus changes.
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = (position.x, position.y);
                 let hit = self.hit(position.x, position.y);
                 self.chrome.hover = hit;
-                if hit.is_some() {
-                    if !self.in_chrome {
-                        self.in_chrome = true;
-                        self.page_leave();
-                    }
-                } else {
-                    self.in_chrome = false;
-                    self.input(InputEvent::MouseMove {
-                        x: position.x as i32,
-                        y: (position.y - self.chrome.toolbar_px() as f64) as i32,
-                        modifiers: self.modifiers(),
-                        leave: false,
-                    });
-                }
             }
             WindowEvent::CursorLeft { .. } => {
                 self.chrome.hover = None;
-                self.in_chrome = true;
-                self.page_leave();
             }
-            WindowEvent::MouseInput { state, button, .. } => {
+            WindowEvent::MouseInput { state, .. } => {
                 if let Some(hit) = self.hit(self.cursor.0, self.cursor.1) {
                     if state == ElementState::Pressed {
                         self.activate(hit);
                     }
-                    return;
                 }
-                let button = match button {
-                    WinitButton::Left => MouseButton::Left,
-                    WinitButton::Middle => MouseButton::Middle,
-                    WinitButton::Right => MouseButton::Right,
-                    _ => return,
-                };
-                self.input(InputEvent::MouseClick {
-                    x: self.cursor.0 as i32,
-                    y: (self.cursor.1 - self.chrome.toolbar_px() as f64) as i32,
-                    modifiers: self.modifiers(),
-                    button,
-                    up: state == ElementState::Released,
-                    click_count: 1,
-                });
             }
-            WindowEvent::MouseWheel { delta, .. } => {
-                if self.in_chrome {
-                    return;
-                }
-                // A line is roughly 40 DIP; CEF wants pixel deltas.
-                let (dx, dy) = match delta {
-                    MouseScrollDelta::LineDelta(x, y) => {
-                        ((x * 40.0) as i32, (y * 40.0) as i32)
-                    }
-                    MouseScrollDelta::PixelDelta(p) => (p.x as i32, p.y as i32),
-                };
-                self.input(InputEvent::MouseWheel {
-                    x: self.cursor.0 as i32,
-                    y: (self.cursor.1 - self.chrome.toolbar_px() as f64) as i32,
-                    modifiers: self.modifiers(),
-                    delta_x: dx,
-                    delta_y: dy,
-                });
+            WindowEvent::MouseWheel { .. } => {
+                // The page scrolls itself: the child window receives the event.
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 if self.chrome.editing {
@@ -490,10 +428,12 @@ impl ApplicationHandler for Shell {
                         match self.chrome.key(&event.logical_key, self.modifiers) {
                             Edit::Navigate(text) => self.navigate(&text),
                             Edit::Cancel => {
-                                let _ = self.engine.execute(Command::SetFocus {
-                                    view: self.view,
-                                    focused: true,
-                                });
+                                if let Some(view) = self.view {
+                                    let _ = self.engine.execute(Command::SetFocus {
+                                        view,
+                                        focused: true,
+                                    });
+                                }
                             }
                             Edit::None => {}
                         }
@@ -506,58 +446,27 @@ impl ApplicationHandler for Shell {
                     match &event.logical_key {
                         Key::Character(c) if ctrl && c.eq_ignore_ascii_case("l") => {
                             self.chrome.begin_edit();
-                            let _ = self.engine.execute(Command::SetFocus {
-                                view: self.view,
-                                focused: false,
-                            });
-                            return;
+                            if let Some(view) = self.view {
+                                let _ = self.engine.execute(Command::SetFocus {
+                                    view,
+                                    focused: false,
+                                });
+                            }
                         }
                         Key::Character(c) if ctrl && c.eq_ignore_ascii_case("r") => {
                             self.reload();
-                            return;
                         }
                         Key::Named(NamedKey::F5) => {
                             self.reload();
-                            return;
                         }
                         Key::Named(NamedKey::ArrowLeft) if alt => {
                             self.back();
-                            return;
                         }
                         Key::Named(NamedKey::ArrowRight) if alt => {
                             self.forward();
-                            return;
                         }
                         _ => {}
                     }
-                }
-                let (code, character) = key_code(&event.logical_key);
-                let modifiers = self.modifiers();
-                let kind = match event.state {
-                    ElementState::Pressed => KeyKind::RawKeyDown,
-                    ElementState::Released => KeyKind::KeyUp,
-                };
-                self.input(InputEvent::Key {
-                    kind,
-                    modifiers,
-                    windows_key_code: code,
-                    native_key_code: code,
-                    is_system_key: false,
-                    character,
-                    unmodified_character: character,
-                });
-                // A printable key also produces a character event, which is what
-                // actually inserts text into a field.
-                if event.state == ElementState::Pressed && character != 0 {
-                    self.input(InputEvent::Key {
-                        kind: KeyKind::Char,
-                        modifiers,
-                        windows_key_code: code,
-                        native_key_code: code,
-                        is_system_key: false,
-                        character,
-                        unmodified_character: character,
-                    });
                 }
             }
             _ => {}
@@ -572,11 +481,13 @@ impl ApplicationHandler for Shell {
         // waits for the engine's current pump slice, so it runs a few times a
         // second rather than on every frame.
         if self.ticks % 20 == 0 {
-            if let Some(url) = self.engine.view_url(self.view) {
-                self.chrome.url = url;
+            if let Some(view) = self.view {
+                if let Some(url) = self.engine.view_url(view) {
+                    self.chrome.url = url;
+                }
+                self.chrome.back = self.engine.can_go_back(view);
+                self.chrome.forward = self.engine.can_go_forward(view);
             }
-            self.chrome.back = self.engine.can_go_back(self.view);
-            self.chrome.forward = self.engine.can_go_forward(self.view);
         }
         if self.ticks % 30 == 0 {
             self.chrome.caret_on = !self.chrome.caret_on;
@@ -589,22 +500,16 @@ impl ApplicationHandler for Shell {
         if let Some(window) = self.window.as_ref() {
             window.request_redraw();
         }
-        if self.selftest != 0 && (self.ticks >= self.selftest || self.content) {
-            match self.last_frame {
-                Some((w, h, non_white)) => {
-                    println!(
-                        "window selftest: presented={} frame={}x{} non_white={} last={}",
-                        self.presented, w, h, non_white, self.last_reason
-                    );
-                    if let Some(hist) = self.last_hist.as_ref() {
-                        println!("window selftest: top colors {hist}");
-                    }
-                }
-                None => println!(
-                    "window selftest: presented={} no frame last={}",
-                    self.presented, self.last_reason
-                ),
-            }
+        if self.selftest != 0 && self.ticks >= self.selftest {
+            println!(
+                "window selftest: presented={} view={} last={}",
+                self.presented,
+                match self.view {
+                    Some(view) => view.to_string(),
+                    None => "none".to_string(),
+                },
+                self.last_reason
+            );
             event_loop.exit();
             return;
         }
@@ -638,62 +543,6 @@ fn normalize(text: &str) -> Option<Url> {
         }
     }
     Url::parse(&format!("https://duckduckgo.com/?q={query}")).ok()
-}
-
-
-/// The eight most common colours in a BGRA frame, as `#rrggbb:count`.
-fn histogram(bgra: &[u8]) -> String {
-    use std::collections::HashMap;
-    let mut counts: HashMap<u32, usize> = HashMap::new();
-    for px in bgra.chunks_exact(4) {
-        let key = ((px[2] as u32) << 16) | ((px[1] as u32) << 8) | px[0] as u32;
-        *counts.entry(key).or_insert(0) += 1;
-    }
-    let mut top: Vec<(u32, usize)> = counts.into_iter().collect();
-    top.sort_by_key(|a| std::cmp::Reverse(a.1));
-    top.into_iter()
-        .take(8)
-        .map(|(c, n)| format!("#{c:06x}:{n}"))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-/// Map a winit key to a Windows virtual-key code and, for printable keys, the
-/// UTF-16 unit CEF expects in `character`.
-fn key_code(key: &Key) -> (i32, u32) {
-    match key {
-        Key::Named(named) => {
-            let code = match named {
-                NamedKey::Enter => 13,
-                NamedKey::Backspace => 8,
-                NamedKey::Tab => 9,
-                NamedKey::Escape => 27,
-                NamedKey::Space => 32,
-                NamedKey::PageUp => 33,
-                NamedKey::PageDown => 34,
-                NamedKey::End => 35,
-                NamedKey::Home => 36,
-                NamedKey::ArrowLeft => 37,
-                NamedKey::ArrowUp => 38,
-                NamedKey::ArrowRight => 39,
-                NamedKey::ArrowDown => 40,
-                NamedKey::Delete => 46,
-                _ => 0,
-            };
-            (code, 0)
-        }
-        Key::Character(text) => {
-            let mut chars = text.chars();
-            match (chars.next(), chars.next()) {
-                (Some(c), None) => {
-                    let upper = c.to_ascii_uppercase() as i32;
-                    (upper, c as u32)
-                }
-                _ => (0, 0),
-            }
-        }
-        _ => (0, 0),
-    }
 }
 
 #[cfg(test)]

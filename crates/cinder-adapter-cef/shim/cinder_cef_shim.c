@@ -14,12 +14,17 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 
 #ifdef _WIN32
 #include <windows.h>
 #else
 #include <pthread.h>
 #include <unistd.h>
+#endif
+
+#if defined(__linux__)
+#include <dlfcn.h>
 #endif
 
 #include "include/capi/cef_app_capi.h"
@@ -47,6 +52,9 @@ typedef struct {
   int width;
   int height;
   int browser_id;
+  /* Non-zero when CEF owns a child window inside the shell's window. */
+  int native;
+  unsigned long long parent;
   unsigned char* frame;
   size_t frame_cap;
   char title[512];
@@ -317,14 +325,6 @@ static void CEF_CALLBACK render_on_paint(struct _cef_render_handler_t* self,
   v->width = width;
   v->height = height;
   v->state |= CINDER_CEF_PAINTED;
-  if (getenv("CINDER_CEF_TRACE")) {
-    static int paints;
-    paints++;
-    fprintf(stderr, "[cef] on_paint #%d %dx%d first=%02x%02x%02x%02x\n", paints, width,
-            height, ((const unsigned char*)buffer)[0],
-            ((const unsigned char*)buffer)[1], ((const unsigned char*)buffer)[2],
-            ((const unsigned char*)buffer)[3]);
-  }
   emit(v->id, CINDER_CEF_EV_PAINTED, NULL, NULL);
 }
 
@@ -557,6 +557,36 @@ static void url_host(const char* url, char* out, size_t cap) {
   out[n] = '\0';
 }
 
+/* Loopback names this machine, where a plain-HTTP server is normally a local
+ * development server rather than something to upgrade. Mirrors
+ * `is_loopback` in cinder-adapter's policy so both layers agree. */
+static int host_is_loopback(const char* host) {
+  const char* p;
+  int dots = 0;
+  if (!host || !*host) {
+    return 0;
+  }
+  if (strcmp(host, "localhost") == 0 || strcmp(host, "::1") == 0 ||
+      strcmp(host, "[::1]") == 0) {
+    return 1;
+  }
+  if (strlen(host) > 10 && strcmp(host + strlen(host) - 10, ".localhost") == 0) {
+    return 1;
+  }
+  /* 127.0.0.0/8: four dot-separated decimal parts, the first one 127. */
+  if (strncmp(host, "127.", 4) != 0) {
+    return 0;
+  }
+  for (p = host; *p; p++) {
+    if (*p == '.') {
+      dots++;
+    } else if (*p < '0' || *p > '9') {
+      return 0;
+    }
+  }
+  return dots == 3;
+}
+
 static int host_is_blocked(const char* host) {
   int i;
   size_t host_len = strlen(host);
@@ -612,7 +642,7 @@ static cef_return_value_t CEF_CALLBACK resource_on_before_resource_load(
     return RV_CANCEL;
   }
 
-  if (upgrade && strncmp(url, "http://", 7) == 0) {
+  if (upgrade && strncmp(url, "http://", 7) == 0 && !host_is_loopback(host)) {
     char upgraded[2048];
     cef_string_t upgraded_str = {0};
     snprintf(upgraded, sizeof(upgraded), "https://%s", url + 7);
@@ -767,6 +797,12 @@ int cinder_cef_execute_process(int argc, char** argv) {
 
 int cinder_cef_init(int argc, char** argv, const char* resources_dir,
                     const char* locales_dir, const char* cache_dir) {
+  return cinder_cef_init_ex(argc, argv, resources_dir, locales_dir, cache_dir, 1);
+}
+
+int cinder_cef_init_ex(int argc, char** argv, const char* resources_dir,
+                       const char* locales_dir, const char* cache_dir,
+                       int windowless) {
   cef_main_args_t args;
   cef_settings_t settings;
 
@@ -775,7 +811,7 @@ int cinder_cef_init(int argc, char** argv, const char* resources_dir,
   memset(&settings, 0, sizeof(settings));
   settings.size = sizeof(cef_settings_t);
   settings.no_sandbox = 1;
-  settings.windowless_rendering_enabled = 1;
+  settings.windowless_rendering_enabled = windowless ? 1 : 0;
   settings.log_severity = LOGSEVERITY_WARNING;
   settings.background_color = 0xFFFFFFFFu;
   if (resources_dir) {
@@ -810,7 +846,8 @@ void cinder_cef_set_event_callback(cinder_cef_event_fn cb, void* user_data) {
   g_event_user = user_data;
 }
 
-int cinder_cef_create_view(int view_id, const char* url, int width, int height) {
+int cinder_cef_create_view(int view_id, const char* url, int width, int height,
+                           unsigned long long parent, int top) {
   cef_window_info_t window_info;
   cef_browser_settings_t browser_settings;
   cef_string_t url_str = {0};
@@ -831,17 +868,26 @@ int cinder_cef_create_view(int view_id, const char* url, int width, int height) 
   }
   v->width = width;
   v->height = height;
+  v->native = parent != 0;
+  v->parent = parent;
   if (url) {
     snprintf(v->url, sizeof(v->url), "%s", url);
   }
 
   memset(&window_info, 0, sizeof(window_info));
   window_info.size = sizeof(cef_window_info_t);
-  window_info.windowless_rendering_enabled = 1;
+  window_info.windowless_rendering_enabled = v->native ? 0 : 1;
   window_info.bounds.x = 0;
-  window_info.bounds.y = 0;
+  window_info.bounds.y = top > 0 ? top : 0;
   window_info.bounds.width = width;
   window_info.bounds.height = height;
+  if (v->native) {
+#ifdef __APPLE__
+    window_info.parent_view = (cef_window_handle_t)parent;
+#else
+    window_info.parent_window = (cef_window_handle_t)parent;
+#endif
+  }
 
   memset(&browser_settings, 0, sizeof(browser_settings));
   browser_settings.size = sizeof(cef_browser_settings_t);
@@ -866,7 +912,7 @@ int cinder_cef_create_view(int view_id, const char* url, int width, int height) 
 }
 
 int cinder_cef_create_browser(const char* url, int width, int height) {
-  return cinder_cef_create_view(1, url, width, height);
+  return cinder_cef_create_view(1, url, width, height, 0, 0);
 }
 
 int cinder_cef_close_view(int view_id, int force) {
@@ -1004,6 +1050,42 @@ int cinder_cef_find(int view_id, const char* query, int forward) {
   return 1;
 }
 
+/* Windowed browsers own a native child window, and CEF leaves resizing it to the
+ * embedder. Xlib is loaded lazily so the build needs neither X11 headers nor the
+ * development package; every desktop that can show the window has libX11.so.6. */
+#if defined(__linux__)
+typedef struct _XDisplay XDisplay;
+typedef unsigned long XWindow;
+static XDisplay* g_x_display;
+static int (*g_x_resize)(XDisplay*, XWindow, unsigned int, unsigned int);
+static int (*g_x_flush)(XDisplay*);
+
+static int resize_native_window(unsigned long long window, int width, int height) {
+  if (!g_x_resize) {
+    void* lib = dlopen("libX11.so.6", RTLD_LAZY | RTLD_LOCAL);
+    XDisplay* (*open_display)(const char*);
+    if (!lib) {
+      return 0;
+    }
+    open_display = (XDisplay * (*)(const char*)) dlsym(lib, "XOpenDisplay");
+    g_x_resize = (int (*)(XDisplay*, XWindow, unsigned int, unsigned int))
+        dlsym(lib, "XResizeWindow");
+    g_x_flush = (int (*)(XDisplay*)) dlsym(lib, "XFlush");
+    if (!open_display || !g_x_resize || !g_x_flush) {
+      return 0;
+    }
+    g_x_display = open_display(NULL);
+    if (!g_x_display) {
+      return 0;
+    }
+  }
+  g_x_resize(g_x_display, (XWindow)window, (unsigned int)width,
+             (unsigned int)height);
+  g_x_flush(g_x_display);
+  return 1;
+}
+#endif
+
 int cinder_cef_resize(int view_id, int width, int height) {
   cinder_view_t* v = view_by_id(view_id);
   cef_browser_host_t* host;
@@ -1019,7 +1101,16 @@ int cinder_cef_resize(int view_id, int width, int height) {
   if (!host) {
     return 0;
   }
-  host->was_resized(host);
+  if (v->native) {
+#if defined(__linux__)
+    cef_window_handle_t handle = host->get_window_handle(host);
+    if (handle) {
+      resize_native_window((unsigned long long)handle, width, height);
+    }
+#endif
+  } else {
+    host->was_resized(host);
+  }
   release_host(host);
   return 1;
 }

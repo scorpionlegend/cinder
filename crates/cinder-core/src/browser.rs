@@ -164,6 +164,17 @@ impl Browser {
         self.profile
     }
 
+    /// Replace the surface future tabs are created on. The shell learns its
+    /// native window handle only after the window exists, so the surface is
+    /// chosen before the first tab rather than at construction.
+    pub fn set_surface(&mut self, surface: Surface) {
+        self.surface = surface;
+    }
+
+    pub fn surface(&self) -> Surface {
+        self.surface
+    }
+
     pub fn policy(&self) -> &Arc<PolicySnapshot> {
         &self.policy
     }

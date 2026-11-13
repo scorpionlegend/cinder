@@ -43,6 +43,8 @@ mod ffi {
             url: *const c_char,
             width: c_int,
             height: c_int,
+            parent: u64,
+            top: c_int,
         ) -> c_int;
         pub fn cinder_cef_close_view(view_id: c_int, force: c_int) -> c_int;
         pub fn cinder_cef_navigate(view_id: c_int, url: *const c_char) -> c_int;
@@ -131,6 +133,9 @@ pub struct CefEngineConfig {
     pub cache_dir: PathBuf,
     /// Extra Chromium switches, appended to the command line.
     pub extra_args: Vec<String>,
+    /// Whether this process paints off-screen. A windowed shell sets this to
+    /// `false` so CEF creates native child windows instead.
+    pub windowless: bool,
     /// What this build actually provides. Defaults to [`measured_capabilities`].
     pub capabilities: Capabilities,
 }
@@ -147,6 +152,7 @@ impl CefEngineConfig {
             locales_dir: dir.join("locales"),
             cache_dir: cache,
             extra_args: Vec::new(),
+            windowless: true,
             capabilities: measured_capabilities(),
         }
     }
@@ -622,16 +628,13 @@ fn run_engine(
     event_tx: Sender<EngineMessage>,
     init_tx: Sender<Result<(), String>>,
 ) {
-    let cef = if config.extra_args.is_empty() {
-        Cef::init(&config.resources_dir, &config.locales_dir, &config.cache_dir)
-    } else {
-        Cef::init_with_args(
-            &config.resources_dir,
-            &config.locales_dir,
-            &config.cache_dir,
-            &config.extra_args,
-        )
-    };
+    let cef = Cef::init_with_args_mode(
+        &config.resources_dir,
+        &config.locales_dir,
+        &config.cache_dir,
+        &config.extra_args,
+        config.windowless,
+    );
     let cef = match cef {
         Ok(cef) => cef,
         Err(e) => {
@@ -923,10 +926,10 @@ fn handle(
             if !state.profiles.contains_key(&profile) {
                 return Err(AdapterError::ProfileClosed);
             }
-            if matches!(surface, Surface::NativeChild { .. }) {
-                // Windowless rendering only: there is no window to embed into.
-                return Err(AdapterError::Unsupported("native_child_surface"));
-            }
+            let (parent, top) = match surface {
+                Surface::NativeChild { parent, top, .. } => (parent, top),
+                Surface::Offscreen { .. } => (0, 0),
+            };
             let (width, height) = surface.size();
             let url = initial_url
                 .as_ref()
@@ -938,7 +941,14 @@ fn handle(
             let raw = view.get() as c_int;
             // SAFETY: engine thread; url is NUL-terminated; dimensions validated.
             let ok = unsafe {
-                ffi::cinder_cef_create_view(raw, url.as_ptr(), width as c_int, height as c_int)
+                ffi::cinder_cef_create_view(
+                    raw,
+                    url.as_ptr(),
+                    width as c_int,
+                    height as c_int,
+                    parent,
+                    top as c_int,
+                )
             };
             if ok != 1 {
                 return Err(AdapterError::EngineFault(Cef::last_error()));

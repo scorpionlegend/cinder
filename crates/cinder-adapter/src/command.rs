@@ -11,7 +11,19 @@ use crate::sanitize::Url;
 /// U2 (off-screen) are interchangeable behind it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Surface {
-    NativeChild { width: u32, height: u32, scale: f32 },
+    /// A child window the engine creates inside the shell's window. `parent` is
+    /// the shell's platform handle — an X11 window id on Linux, an `HWND` on
+    /// Windows, an `NSView` pointer on macOS — and zero means "no parent", which
+    /// is invalid.
+    NativeChild {
+        parent: u64,
+        /// Offset of the page area from the top of the parent, in physical
+        /// pixels: the toolbar occupies that strip.
+        top: u32,
+        width: u32,
+        height: u32,
+        scale: f32,
+    },
     Offscreen { width: u32, height: u32 },
 }
 
@@ -192,7 +204,10 @@ impl Command {
                 if w == 0 || h == 0 {
                     return Err(AdapterError::InvalidArgument("surface has a zero dimension"));
                 }
-                if let Surface::NativeChild { scale, .. } = surface {
+                if let Surface::NativeChild { parent, scale, .. } = surface {
+                    if *parent == 0 {
+                        return Err(AdapterError::InvalidArgument("native surface has no parent"));
+                    }
                     if !scale.is_finite() || *scale <= 0.0 {
                         return Err(AdapterError::InvalidArgument("scale must be positive"));
                     }
@@ -257,6 +272,22 @@ mod tests {
         let cmd = Command::CreateView {
             profile: ProfileId::from_raw(1),
             surface: Surface::Offscreen { width: 0, height: 10 },
+            initial_url: None,
+        };
+        assert!(cmd.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_native_surface_without_parent() {
+        let cmd = Command::CreateView {
+            profile: ProfileId::from_raw(1),
+            surface: Surface::NativeChild {
+                parent: 0,
+                top: 0,
+                width: 10,
+                height: 10,
+                scale: 1.0,
+            },
             initial_url: None,
         };
         assert!(cmd.validate().is_err());

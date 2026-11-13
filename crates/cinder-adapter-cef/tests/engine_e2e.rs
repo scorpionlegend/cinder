@@ -111,6 +111,7 @@ fn config() -> CefEngineConfig {
             "--ozone-platform=headless".into(),
             format!("--user-data-dir={}", cache.display()),
         ],
+        windowless: true,
         capabilities: cinder_adapter_cef::measured_capabilities(),
     }
 }
@@ -295,6 +296,8 @@ fn run() -> Vec<String> {
             .execute(Command::CreateView {
                 profile,
                 surface: Surface::NativeChild {
+                    parent: 0,
+                    top: 0,
                     width: 800,
                     height: 600,
                     scale: 1.0,
@@ -302,7 +305,7 @@ fn run() -> Vec<String> {
                 initial_url: None,
             })
             .is_err(),
-        "NativeChild surface is refused",
+        "NativeChild surface without a parent window is refused",
     );
 
     check.that(
