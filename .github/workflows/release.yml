@@ -215,6 +215,26 @@ jobs:
 
       # A SIGTRAP inside Chromium leaves no log line, but lldb stops on it and
       # can print the stack. Batch mode runs the selftest and dumps the frames.
+      # Chromium's CHECK text goes to the debugger, not to stderr, on Windows:
+      # the log file is only opened later in startup. Attaching cdb prints the
+      # message and stops on the breakpoint instead of losing it.
+      - name: Window selftest under a debugger
+        if: always() && contains(matrix.target, 'windows')
+        continue-on-error: true
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          set -euo pipefail
+          cdb="/c/Program Files (x86)/Windows Kits/10/Debuggers/x64/cdb.exe"
+          if [ ! -x "$cdb" ]; then
+            echo "cdb is not installed on this runner"
+            exit 0
+          fi
+          bin=$(echo ./smoke/cinder-*/cinder.exe)
+          CINDER_WINDOW_SELFTEST=8 CINDER_NO_UPDATE_CHECK=1 \
+            perl -e 'alarm 180; exec @ARGV' "$cdb" -g -G -c "g; kb; q" -- "$bin" about:blank \
+            2>&1 | tail -60 || true
+
       - name: Window selftest backtrace
         if: always() && contains(matrix.target, 'darwin')
         continue-on-error: true

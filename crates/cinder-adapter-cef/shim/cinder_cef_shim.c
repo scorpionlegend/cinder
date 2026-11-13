@@ -977,6 +977,12 @@ int cinder_cef_init_ex(int argc, char** argv, const char* resources_dir,
   }
 
   trace("init enter", windowless, 0);
+  /* If any of these is zero the string never reached CEF, which sends
+   * Chromium looking for resources and a locale pak in the wrong place. */
+  trace("settings strings", (long)settings.locale.length,
+        (long)settings.resources_dir_path.length);
+  trace("settings paths", (long)settings.locales_dir_path.length,
+        (long)settings.log_file.length);
   install_crash_diagnostics();
   if (!cef_initialize(&args, &settings, &g_app, NULL)) {
     set_error("cef_initialize failed");
