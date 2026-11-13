@@ -461,6 +461,10 @@ pub struct CefEngine {
     core: Mutex<Option<EngineCore>>,
     capabilities: Capabilities,
     closed: AtomicBool,
+    /// Whether `send` pumps before serving. macOS turns this off because the
+    /// pump spins AppKit's run loop, which must not happen inside a winit
+    /// callback; the window layer pumps from the main queue instead.
+    pump_in_send: AtomicBool,
     join: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -488,6 +492,7 @@ impl CefEngine {
                 core: Mutex::new(Some(core)),
                 capabilities,
                 closed: AtomicBool::new(false),
+                pump_in_send: AtomicBool::new(true),
                 join: Mutex::new(None),
             });
         }
@@ -506,6 +511,7 @@ impl CefEngine {
                 core: Mutex::new(None),
                 capabilities,
                 closed: AtomicBool::new(false),
+                pump_in_send: AtomicBool::new(true),
                 join: Mutex::new(Some(join)),
             }),
             Ok(Err(message)) => {
@@ -524,7 +530,9 @@ impl CefEngine {
         };
         let mut guard = self.core.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(core) = guard.as_mut() {
-            core.pump();
+            if self.pump_in_send.load(Ordering::Relaxed) {
+                core.pump();
+            }
             let alive = core.serve(request);
             let result = ack_rx.recv_timeout(ACCEPT_TIMEOUT).unwrap_or_else(|_| {
                 Err(AdapterError::EngineFault(
@@ -563,7 +571,9 @@ impl CefEngine {
         let request = make(ack_tx);
         let mut guard = self.core.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(core) = guard.as_mut() {
-            core.pump();
+            if self.pump_in_send.load(Ordering::Relaxed) {
+                core.pump();
+            }
             core.serve(request);
             return ack_rx.recv_timeout(timeout).ok();
         }
@@ -572,6 +582,12 @@ impl CefEngine {
         tx.as_ref()?.send(request).ok()?;
         drop(tx);
         ack_rx.recv_timeout(timeout).ok()
+    }
+
+    /// Whether `send` pumps CEF before serving a command. Turning this off
+    /// leaves pumping to the caller, which is what macOS needs.
+    pub fn set_pump_in_send(&self, on: bool) {
+        self.pump_in_send.store(on, Ordering::Relaxed);
     }
 
     /// Advance CEF by one slice when the engine runs inline. A no-op when the

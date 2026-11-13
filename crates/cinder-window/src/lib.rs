@@ -51,6 +51,47 @@ fn trace(message: &str) {
 /// The last step reached, so a watchdog can name where a hang is stuck.
 static STAGE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
+/// Queue one CEF pump on the main dispatch queue.
+///
+/// The block runs while the run loop drains the queue, which is outside
+/// winit's event handler; pumping from inside that handler makes AppKit
+/// re-enter it and winit aborts. A pump already in progress is skipped so a
+/// nested run loop cannot stack pumps.
+#[cfg(target_os = "macos")]
+fn schedule_pump(engine: &Arc<CefEngine>) {
+    use std::cell::Cell;
+    use std::os::raw::c_void;
+
+    thread_local! {
+        static PUMPING: Cell<bool> = const { Cell::new(false) };
+    }
+
+    extern "C" {
+        fn dispatch_get_main_queue() -> *mut c_void;
+        fn dispatch_async_f(
+            queue: *mut c_void,
+            context: *mut c_void,
+            work: extern "C" fn(*mut c_void),
+        );
+    }
+
+    extern "C" fn run(context: *mut c_void) {
+        // SAFETY: `schedule_pump` hands over one strong reference and this is
+        // the only place that takes it back.
+        let engine = unsafe { Arc::from_raw(context as *const CefEngine) };
+        let busy = PUMPING.with(|flag| flag.replace(true));
+        if !busy {
+            engine.pump();
+            PUMPING.with(|flag| flag.set(false));
+        }
+    }
+
+    let context = Arc::into_raw(engine.clone()) as *mut c_void;
+    // SAFETY: the main queue is a process-wide singleton and the callback
+    // matches the signature dispatch expects.
+    unsafe { dispatch_async_f(dispatch_get_main_queue(), context, run) };
+}
+
 /// How long the selftest may go without finishing before it reports the step it
 /// is stuck in and exits. A hang inside winit or CEF never returns, so the
 /// outer shell bound would otherwise kill the process with no explanation.
@@ -167,6 +208,12 @@ pub fn run_on(
     tick: impl FnMut() + 'static,
 ) -> Result<(), WindowError> {
     event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + TICK));
+    // Pumping CEF from inside a winit callback spins AppKit's run loop, which
+    // re-enters winit's event handler and panics ("tried to handle event while
+    // another event is currently being handled"). On macOS the pump is
+    // therefore deferred to the main queue, which runs outside that callback.
+    #[cfg(target_os = "macos")]
+    engine.set_pump_in_send(false);
     let mut app = Shell {
         engine,
         view: None,
@@ -580,7 +627,12 @@ impl ApplicationHandler for Shell {
             trace(&format!("tick {} before pump", self.ticks));
         }
         // Inline engines (CEF on macOS and Windows) only advance when the
-        // thread that owns them pumps; on Linux this is a no-op.
+        // thread that owns them pumps; on Linux this is a no-op. On macOS the
+        // pump has to leave this callback first, or AppKit's nested run loop
+        // re-enters winit's handler.
+        #[cfg(target_os = "macos")]
+        schedule_pump(&self.engine);
+        #[cfg(not(target_os = "macos"))]
         self.engine.pump();
         (self.tick)();
         if self.selftest != 0 {
