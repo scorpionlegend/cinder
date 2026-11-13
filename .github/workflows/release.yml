@@ -147,10 +147,6 @@ jobs:
             echo "bundle has no locale pak" >&2
             exit 1
           fi
-          if ! find smoke -path '*locales/*.pak' -print -quit | grep -q .; then
-            echo "bundle has no locales/*.pak" >&2
-            exit 1
-          fi
 
       # The page only appears where the shell can hand the engine a native
       # parent handle. Run the bounded window selftest and require a view: with

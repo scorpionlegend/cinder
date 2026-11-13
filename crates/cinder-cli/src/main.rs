@@ -87,7 +87,20 @@ fn print_help() {
 
 /// A bare argument that names a page rather than a subcommand.
 fn looks_like_url(arg: &str) -> bool {
-    arg.contains("://") || arg.starts_with("www.") || arg.contains('.')
+    if arg.contains("://") || arg.starts_with("www.") || arg.contains('.') {
+        return true;
+    }
+    // Scheme-only URLs such as `about:blank` carry no dot and no `//`, so they
+    // would otherwise be rejected as unknown commands.
+    match arg.split_once(':') {
+        Some((scheme, _)) => {
+            scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+                && scheme
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+        }
+        None => false,
+    }
 }
 
 fn run_demo() -> i32 {
@@ -696,4 +709,32 @@ fn truncate(input: &str, max: usize) -> String {
     }
     let kept: String = input.chars().take(max.saturating_sub(1)).collect();
     format!("{kept}…")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::looks_like_url;
+
+    #[test]
+    fn recognises_urls_and_schemes() {
+        for url in [
+            "https://example.com",
+            "http://127.0.0.1:8099/",
+            "www.example.com",
+            "example.com",
+            "about:blank",
+            "file:///tmp/page.html",
+        ] {
+            assert!(looks_like_url(url), "{url} should be treated as a URL");
+        }
+    }
+
+    #[test]
+    fn rejects_commands_and_plain_words() {
+        for arg in ["demo", "help", "version", "update", "browse", "open"] {
+            assert!(!looks_like_url(arg), "{arg} should not be a URL");
+        }
+        assert!(!looks_like_url(":blank"));
+        assert!(!looks_like_url("1nvalid:scheme"));
+    }
 }
