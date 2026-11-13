@@ -173,6 +173,25 @@ jobs:
             echo "::warning::the window never got a page view (exit $code)"
           fi
 
+      # A SIGTRAP inside Chromium leaves no log line, but macOS writes a crash
+      # report. Print the newest ones so the faulting frame is in the job log.
+      - name: Window selftest crash reports
+        if: always() && contains(matrix.target, 'darwin')
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir="$HOME/Library/Logs/DiagnosticReports"
+          if [ ! -d "$dir" ]; then
+            echo "no crash report directory"
+            exit 0
+          fi
+          ls -t "$dir" | head -10
+          for f in $(ls -t "$dir"/*.ips 2>/dev/null | head -2); do
+            echo "=== $f ==="
+            head -c 40000 "$f"
+            echo
+          done
+
       # Windows ships an .msi and a setup .exe on top of the portable .zip.
       # Both are built from the same staged bundle the smoke test just ran.
       - name: Build Windows installers

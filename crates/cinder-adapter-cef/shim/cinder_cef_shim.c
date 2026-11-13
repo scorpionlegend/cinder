@@ -105,6 +105,25 @@ static void set_error(const char* msg) {
   snprintf(g_error, sizeof(g_error), "%s", msg ? msg : "");
 }
 
+/* The window selftest sets CINDER_WINDOW_SELFTEST; when it is set every step
+ * that can abort inside libcef leaves a line on stderr, so a crash with no
+ * message still says where it happened. Production runs pay one getenv. */
+static int trace_on(void) {
+  static int on = -1;
+  if (on < 0) {
+    on = getenv("CINDER_WINDOW_SELFTEST") != NULL ? 1 : 0;
+  }
+  return on;
+}
+
+static void trace(const char* step, long a, long b) {
+  if (!trace_on()) {
+    return;
+  }
+  fprintf(stderr, "window trace: shim %s (%ld, %ld)\n", step, a, b);
+  fflush(stderr);
+}
+
 static void emit(int view_id, int kind, const char* a, const char* b) {
   if (g_event_cb) {
     g_event_cb(g_event_user, view_id, kind, a ? a : "", b ? b : "");
@@ -360,6 +379,7 @@ static void CEF_CALLBACK life_on_after_created(
   v->browser = browser;
   v->browser_id = browser->get_identifier(browser);
   v->state |= CINDER_CEF_CREATED;
+  trace("after_created", (long)v->id, (long)v->browser_id);
   emit(v->id, CINDER_CEF_EV_CREATED, v->url, NULL);
 }
 
@@ -791,11 +811,16 @@ static void fill_main_args(cef_main_args_t* args, int argc, char** argv) {
 
 int cinder_cef_execute_process(int argc, char** argv) {
   cef_main_args_t args;
+  int code;
+  trace("execute_process enter", argc, 0);
   if (!configure_api_version()) {
+    trace("execute_process api hash failed", 0, 0);
     return -1;
   }
   fill_main_args(&args, argc, argv);
-  return cef_execute_process(&args, &g_app, NULL);
+  code = cef_execute_process(&args, &g_app, NULL);
+  trace("execute_process done", code, 0);
+  return code;
 }
 
 int cinder_cef_init(int argc, char** argv, const char* resources_dir,
@@ -837,10 +862,13 @@ int cinder_cef_init_ex(int argc, char** argv, const char* resources_dir,
     return 0;
   }
 
+  trace("init enter", windowless, 0);
   if (!cef_initialize(&args, &settings, &g_app, NULL)) {
     set_error("cef_initialize failed");
+    trace("init failed", 0, 0);
     return 0;
   }
+  trace("init done", 0, 0);
   return 1;
 }
 
@@ -903,14 +931,17 @@ int cinder_cef_create_view(int view_id, const char* url, int width, int height,
                        &url_str);
 
   g_pending_view = (int)(v - g_views);
+  trace("create_view before create_browser", (long)view_id, (long)parent);
   if (!cef_browser_host_create_browser(&window_info, &g_client, &url_str,
                                        &browser_settings, NULL, NULL)) {
     cef_string_clear(&url_str);
     g_pending_view = -1;
     v->used = 0;
     set_error("cef_browser_host_create_browser failed");
+    trace("create_view create_browser failed", (long)view_id, 0);
     return 0;
   }
+  trace("create_view create_browser returned", (long)view_id, 0);
   cef_string_clear(&url_str);
   return 1;
 }

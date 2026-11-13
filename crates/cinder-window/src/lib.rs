@@ -523,7 +523,13 @@ impl ApplicationHandler for Shell {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if self.selftest != 0 {
+            trace(&format!("tick {} before pump", self.ticks));
+        }
         (self.tick)();
+        if self.selftest != 0 {
+            trace(&format!("tick {} after pump", self.ticks));
+        }
         self.ticks += 1;
         // The address and the history flags come from the engine thread, so
         // they are polled rather than pushed. Each poll is a round trip that

@@ -501,6 +501,9 @@ fn run_open(target: Option<&str>) -> i32 {
     };
 
     let staged = cinder_adapter_cef::prepare_runtime(&cinder_adapter_cef::cef_root());
+    if std::env::var_os("CINDER_WINDOW_SELFTEST").is_some() {
+        eprintln!("window trace: runtime staged at {}", staged.display());
+    }
     let config = CefEngineConfig {
         resources_dir: staged.clone(),
         locales_dir: staged.join("locales"),
@@ -515,6 +518,9 @@ fn run_open(target: Option<&str>) -> i32 {
         capabilities: cinder_adapter_cef::measured_capabilities(),
     };
 
+    if std::env::var_os("CINDER_WINDOW_SELFTEST").is_some() {
+        eprintln!("window trace: engine starting");
+    }
     let engine = match CefEngine::new(config) {
         Ok(e) => Arc::new(e),
         Err(e) => {
