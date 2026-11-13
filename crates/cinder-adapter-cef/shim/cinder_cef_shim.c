@@ -787,6 +787,7 @@ static void app_on_before_command_line_processing(
   if (!command_line) {
     return;
   }
+  trace("command line switches", g_switch_count, 0);
   for (i = 0; i < g_switch_count; i++) {
     const char* text = g_switches[i];
     const char* eq = strchr(text, '=');

@@ -42,8 +42,19 @@ const TICK: Duration = Duration::from_millis(16);
 fn trace(message: &str) {
     if std::env::var_os("CINDER_WINDOW_SELFTEST").is_some() {
         eprintln!("window trace: {message}");
+        if let Ok(mut slot) = STAGE.lock() {
+            *slot = Some(message.to_string());
+        }
     }
 }
+
+/// The last step reached, so a watchdog can name where a hang is stuck.
+static STAGE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// How long the selftest may go without finishing before it reports the step it
+/// is stuck in and exits. A hang inside winit or CEF never returns, so the
+/// outer shell bound would otherwise kill the process with no explanation.
+const SELFTEST_STALL: Duration = Duration::from_secs(45);
 
 /// Why the window could not run.
 #[derive(Debug)]
@@ -155,6 +166,18 @@ pub fn run(
             .unwrap_or(0),
     };
     trace("event loop running");
+    if std::env::var_os("CINDER_WINDOW_SELFTEST").is_some() {
+        std::thread::spawn(|| {
+            std::thread::sleep(SELFTEST_STALL);
+            let stage = STAGE
+                .lock()
+                .ok()
+                .and_then(|slot| slot.clone())
+                .unwrap_or_else(|| "start".to_string());
+            eprintln!("window selftest: stalled at {stage}");
+            std::process::exit(70);
+        });
+    }
     event_loop
         .run_app(&mut app)
         .map_err(|e| WindowError::EventLoop(e.to_string()))
