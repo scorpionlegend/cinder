@@ -28,7 +28,9 @@ use winit::application::ApplicationHandler;
 use winit::event::{ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
+#[cfg(target_os = "linux")]
 use winit::platform::x11::EventLoopBuilderExtX11;
+#[cfg(target_os = "linux")]
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::{Window, WindowId};
 
@@ -114,6 +116,7 @@ pub fn run(
     let mut builder = EventLoop::builder();
     // CEF embeds an X11 child window, so the shell must be an X11 window even
     // when the session is Wayland; XWayland provides the display.
+    #[cfg(target_os = "linux")]
     builder.with_x11();
     let event_loop = builder
         .build()
@@ -334,6 +337,12 @@ impl ApplicationHandler for Shell {
         };
         let size = window.inner_size();
         let scale = window.scale_factor() as f32;
+        // CEF's windowed mode embeds a child window, which only this platform's
+        // shell can hand over; elsewhere the parent stays zero, the engine
+        // rejects the view, and the window shows chrome only.
+        #[cfg(not(target_os = "linux"))]
+        let handle: u64 = 0;
+        #[cfg(target_os = "linux")]
         let handle = match window.window_handle().map(|h| h.as_raw()) {
             Ok(RawWindowHandle::Xlib(h)) => h.window,
             Ok(RawWindowHandle::Xcb(h)) => h.window.get() as u64,
