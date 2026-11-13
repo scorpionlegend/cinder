@@ -25,7 +25,11 @@ pub fn root() -> PathBuf {
     )
 }
 
-/// Merge `Resources/` and `Release/` under `root` into `dest`, returning `dest`.
+/// Merge the CEF runtime under `root` into `dest`, returning `dest`.
+///
+/// A CEF distribution keeps its files in `Resources/` and `Release/`; a Cinder
+/// bundle keeps them flat next to the executable. Both layouts are staged, so
+/// the same code works from a checkout and from an installed bundle.
 ///
 /// Files are copied rather than symlinked: Chromium opens the ICU data through
 /// a file descriptor and rejects a symlink there. The result is cached behind a
@@ -36,22 +40,33 @@ pub fn stage(root: &Path, dest: &Path) -> PathBuf {
     }
     let _ = std::fs::remove_dir_all(dest);
     let _ = std::fs::create_dir_all(dest);
+    let mut nested = false;
     for sub in ["Resources", "Release"] {
         let Ok(entries) = std::fs::read_dir(root.join(sub)) else {
             continue;
         };
-        for entry in entries.flatten() {
-            let target = dest.join(entry.file_name());
-            let source = entry.path();
-            if source.is_dir() {
-                let _ = copy_dir(&source, &target);
-            } else {
-                let _ = std::fs::copy(&source, &target);
-            }
+        nested = true;
+        copy_entries(entries, dest);
+    }
+    if !nested {
+        if let Ok(entries) = std::fs::read_dir(root) {
+            copy_entries(entries, dest);
         }
     }
     let _ = std::fs::write(dest.join(".ready"), b"1");
     dest.to_path_buf()
+}
+
+fn copy_entries(entries: std::fs::ReadDir, dest: &Path) {
+    for entry in entries.flatten() {
+        let target = dest.join(entry.file_name());
+        let source = entry.path();
+        if source.is_dir() {
+            let _ = copy_dir(&source, &target);
+        } else {
+            let _ = std::fs::copy(&source, &target);
+        }
+    }
 }
 
 fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
@@ -107,4 +122,56 @@ pub fn prepare(root: &Path) -> PathBuf {
     let staged = stage(root, &dest);
     ensure_loaded(&staged);
     staged
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("cinder-stage-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A CEF distribution keeps its files in `Resources/` and `Release/`.
+    #[test]
+    fn stages_a_nested_distribution() {
+        let root = scratch("nested-root");
+        let dest = scratch("nested-dest");
+        std::fs::create_dir_all(root.join("Resources/locales")).unwrap();
+        std::fs::create_dir_all(root.join("Release")).unwrap();
+        std::fs::write(root.join("Resources/icudtl.dat"), b"icu").unwrap();
+        std::fs::write(root.join("Resources/locales/en-US.pak"), b"pak").unwrap();
+        std::fs::write(root.join("Release/libcef.so"), b"so").unwrap();
+
+        let staged = stage(&root, &dest);
+
+        assert!(staged.join("icudtl.dat").exists());
+        assert!(staged.join("locales/en-US.pak").exists());
+        assert!(staged.join("libcef.so").exists());
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    /// A Cinder bundle keeps the same files flat next to the executable, which
+    /// is what an installed Windows build looks like.
+    #[test]
+    fn stages_a_flat_bundle() {
+        let root = scratch("flat-root");
+        let dest = scratch("flat-dest");
+        std::fs::create_dir_all(root.join("locales")).unwrap();
+        std::fs::write(root.join("icudtl.dat"), b"icu").unwrap();
+        std::fs::write(root.join("locales/en-US.pak"), b"pak").unwrap();
+        std::fs::write(root.join("libcef.dll"), b"dll").unwrap();
+
+        let staged = stage(&root, &dest);
+
+        assert!(staged.join("icudtl.dat").exists());
+        assert!(staged.join("locales/en-US.pak").exists());
+        assert!(staged.join("libcef.dll").exists());
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&dest);
+    }
 }

@@ -152,13 +152,13 @@ jobs:
       # parent handle. Run the bounded window selftest and require a view: with
       # no parent the engine refuses the surface and the window exits with
       # "could not create the page".
-      # Page embedding is proven on Linux; on Windows and macOS the window
-      # opens with chrome but CEF still aborts while creating the view, so this
-      # step reports the trace without blocking the release. Flip
-      # continue-on-error off once the crash is fixed.
+      # Page embedding is proven on Linux and macOS; on Windows the window
+      # opens with chrome but CEF still aborts while creating the view, so the
+      # step only reports the trace there. Flip continue-on-error off for
+      # Windows once that crash is fixed.
       - name: Window selftest
         if: contains(matrix.target, 'windows') || contains(matrix.target, 'darwin')
-        continue-on-error: true
+        continue-on-error: ${{ contains(matrix.target, 'windows') }}
         timeout-minutes: 20
         shell: bash
         run: |
