@@ -539,6 +539,9 @@ fn window_args() -> Vec<String> {
     let mut args: Vec<String> = Vec::new();
     // No GPU on CI runners.
     args.push("--disable-gpu".into());
+    // Chromium writes CHECK failures to its log, not to stderr, on Windows.
+    #[cfg(target_os = "windows")]
+    args.push("--enable-logging=stderr".into());
     // A headless macOS runner has no window server session for the GPU
     // process, which then aborts the browser with "GPU process isn't usable".
     #[cfg(target_os = "macos")]

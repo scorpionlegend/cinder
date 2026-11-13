@@ -18,6 +18,7 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <signal.h>
 #else
 #include <pthread.h>
 #include <unistd.h>
@@ -809,6 +810,57 @@ static void fill_main_args(cef_main_args_t* args, int argc, char** argv) {
 #endif
 }
 
+#ifdef _WIN32
+/* A crash inside cef_initialize leaves no message on stderr: Chromium logs to
+ * its own file and abort() only prints the CRT banner. These handlers print the
+ * faulting module and offset for every frame, which is enough to name the
+ * Chromium check once the addresses are resolved against the CEF symbols. */
+static void print_stack(const char* why, unsigned long code, void* address) {
+  void* frames[48];
+  USHORT count;
+  USHORT i;
+  fprintf(stderr, "cinder: %s code=0x%08lx address=%p\n", why, code, address);
+  count = CaptureStackBackTrace(0, 48, frames, NULL);
+  for (i = 0; i < count; i++) {
+    HMODULE module = NULL;
+    char path[MAX_PATH];
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCSTR)frames[i], &module) &&
+        module) {
+      const char* base;
+      GetModuleFileNameA(module, path, sizeof(path));
+      base = strrchr(path, '\\');
+      fprintf(stderr, "  #%u %s+0x%llx\n", i, base ? base + 1 : path,
+              (unsigned long long)((char*)frames[i] - (char*)module));
+    } else {
+      fprintf(stderr, "  #%u %p\n", i, frames[i]);
+    }
+  }
+  fflush(stderr);
+}
+
+static LONG WINAPI cinder_exception_filter(EXCEPTION_POINTERS* info) {
+  print_stack("unhandled exception",
+              (unsigned long)info->ExceptionRecord->ExceptionCode,
+              info->ExceptionRecord->ExceptionAddress);
+  return EXCEPTION_EXECUTE_HANDLER;
+}
+
+static void cinder_abort_handler(int sig) {
+  (void)sig;
+  print_stack("abort raised", 3, NULL);
+  _exit(4);
+}
+
+static void install_crash_diagnostics(void) {
+  SetUnhandledExceptionFilter(cinder_exception_filter);
+  signal(SIGABRT, cinder_abort_handler);
+}
+#else
+static void install_crash_diagnostics(void) {}
+#endif
+
 int cinder_cef_execute_process(int argc, char** argv) {
   cef_main_args_t args;
   int code;
@@ -858,6 +910,16 @@ int cinder_cef_init_ex(int argc, char** argv, const char* resources_dir,
     cef_string_from_utf8(cache_dir, strlen(cache_dir), &settings.root_cache_path);
     cef_string_from_utf8(cache_dir, strlen(cache_dir), &settings.cache_path);
   }
+  /* Chromium's own CHECK failures are written to its log, not to stderr, on
+   * Windows. CINDER_CEF_LOG=<path> turns on INFO logging to that file so a
+   * crash inside cef_initialize leaves a reason behind. */
+  {
+    const char* log_path = getenv("CINDER_CEF_LOG");
+    if (log_path && log_path[0]) {
+      cef_string_from_utf8(log_path, strlen(log_path), &settings.log_file);
+      settings.log_severity = LOGSEVERITY_INFO;
+    }
+  }
 
   /* libcef derives its struct-version checks from the first cef_api_hash()
    * call. The C++ wrapper does this at startup; using the C API directly means
@@ -867,6 +929,7 @@ int cinder_cef_init_ex(int argc, char** argv, const char* resources_dir,
   }
 
   trace("init enter", windowless, 0);
+  install_crash_diagnostics();
   if (!cef_initialize(&args, &settings, &g_app, NULL)) {
     set_error("cef_initialize failed");
     trace("init failed", 0, 0);

@@ -159,6 +159,7 @@ jobs:
       - name: Window selftest
         if: contains(matrix.target, 'windows') || contains(matrix.target, 'darwin')
         continue-on-error: true
+        timeout-minutes: 20
         shell: bash
         run: |
           set -euo pipefail
@@ -166,9 +167,31 @@ jobs:
             *darwin*) bin=./smoke/cinder-*/Cinder.app/Contents/MacOS/cinder ;;
             *windows*) bin=./smoke/cinder-*/cinder.exe ;;
           esac
-          out=$(CINDER_NO_UPDATE_CHECK=1 CINDER_WINDOW_SELFTEST=8 $bin about:blank 2>&1) && code=0 || code=$?
+          # macOS ships no `timeout`, and a hung CEF init would hold the job
+          # until the six-hour limit, so bound every run with a watchdog.
+          bounded() {
+            local secs=$1 out=$2 code=0
+            shift 2
+            "$@" >"$out" 2>&1 &
+            local pid=$!
+            ( sleep "$secs"; kill -9 "$pid" 2>/dev/null ) &
+            local watchdog=$!
+            wait "$pid" || code=$?
+            kill "$watchdog" 2>/dev/null || true
+            wait "$watchdog" 2>/dev/null || true
+            return $code
+          }
+          bounded 60 "$RUNNER_TEMP/selftest.out" env \
+            CINDER_CEF_LOG="$RUNNER_TEMP/cef-debug.log" \
+            CINDER_NO_UPDATE_CHECK=1 CINDER_WINDOW_SELFTEST=8 \
+            $bin about:blank && code=0 || code=$?
+          out=$(cat "$RUNNER_TEMP/selftest.out")
           echo "$out"
           echo "exit code: $code"
+          if [ -f "$RUNNER_TEMP/cef-debug.log" ]; then
+            echo "=== cef log ==="
+            tail -80 "$RUNNER_TEMP/cef-debug.log"
+          fi
           if ! grep -q "window selftest: .*view=view-" <<<"$out"; then
             echo "::warning::the window never got a page view (exit $code)"
           fi
@@ -176,23 +199,26 @@ jobs:
           # whether that variant survived. Together they separate a thread
           # affinity problem from a settings, GPU or windowless one.
           for v in main main-windowless thread thread-windowless single inproc; do
-            p=$(CINDER_CEF_PROBE=$v CINDER_NO_UPDATE_CHECK=1 $bin about:blank 2>&1) && pc=0 || pc=$?
+            bounded 60 "$RUNNER_TEMP/probe-$v.out" env \
+              CINDER_CEF_LOG="$RUNNER_TEMP/cef-probe-$v.log" \
+              CINDER_CEF_PROBE=$v CINDER_NO_UPDATE_CHECK=1 \
+              $bin about:blank && pc=0 || pc=$?
             echo "probe $v exit=$pc"
-            echo "$p" | grep -E "^probe|shim init" | tail -3 || true
+            grep -E "^probe|shim init|cinder: " "$RUNNER_TEMP/probe-$v.out" | tail -6 || true
           done
           # `browse` uses the same engine without a window: if it also dies the
           # fault is in initialization, not in the native parent handoff.
-          # macOS ships no `timeout`, so only bound the run where it exists.
-          if command -v timeout >/dev/null 2>&1; then TO="timeout 60"; else TO=""; fi
-          b=$(CINDER_NO_UPDATE_CHECK=1 $TO $bin browse about:blank 2>&1) && bc=0 || bc=$?
+          bounded 90 "$RUNNER_TEMP/browse.out" env CINDER_NO_UPDATE_CHECK=1 \
+            $bin browse about:blank && bc=0 || bc=$?
           echo "browse exit=$bc"
-          echo "$b" | tail -15
+          tail -15 "$RUNNER_TEMP/browse.out"
 
       # A SIGTRAP inside Chromium leaves no log line, but lldb stops on it and
       # can print the stack. Batch mode runs the selftest and dumps the frames.
       - name: Window selftest backtrace
         if: always() && contains(matrix.target, 'darwin')
         continue-on-error: true
+        timeout-minutes: 10
         shell: bash
         run: |
           set -euo pipefail
