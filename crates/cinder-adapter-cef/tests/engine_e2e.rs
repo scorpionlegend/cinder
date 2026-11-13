@@ -117,6 +117,7 @@ fn config() -> CefEngineConfig {
         windowless: true,
         main_thread: cinder_adapter_cef::default_main_thread(),
         external_pump: cinder_adapter_cef::default_external_pump(),
+        host_pumps: cinder_adapter_cef::default_host_pumps(),
         capabilities: cinder_adapter_cef::measured_capabilities(),
     }
 }

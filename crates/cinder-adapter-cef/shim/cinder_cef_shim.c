@@ -28,6 +28,10 @@
 #include <dlfcn.h>
 #endif
 
+#ifdef __APPLE__
+#include <CoreFoundation/CoreFoundation.h>
+#endif
+
 #include "include/capi/cef_app_capi.h"
 #include "include/capi/cef_browser_capi.h"
 #include "include/capi/cef_client_capi.h"
@@ -927,6 +931,35 @@ int cinder_cef_init(int argc, char** argv, const char* resources_dir,
   return cinder_cef_init_ex(argc, argv, resources_dir, locales_dir, cache_dir, 1, 0);
 }
 
+#ifdef __APPLE__
+static CFRunLoopTimerRef g_pump_timer = NULL;
+
+static void pump_timer_callout(CFRunLoopTimerRef timer, void* info) {
+  (void)timer;
+  (void)info;
+  cef_do_message_loop_work();
+}
+
+/* Drive CEF from the host's run loop without ever running inside a host
+ * callback. */
+static void install_pump_timer(void) {
+  CFRunLoopTimerContext context;
+  if (g_pump_timer) {
+    return;
+  }
+  memset(&context, 0, sizeof(context));
+  g_pump_timer = CFRunLoopTimerCreate(kCFAllocatorDefault,
+                                      CFAbsoluteTimeGetCurrent(), 0.016, 0, 0,
+                                      pump_timer_callout, &context);
+  if (!g_pump_timer) {
+    trace("pump timer failed", 0, 0);
+    return;
+  }
+  CFRunLoopAddTimer(CFRunLoopGetCurrent(), g_pump_timer, kCFRunLoopCommonModes);
+  trace("pump timer installed", 0, 0);
+}
+#endif
+
 int cinder_cef_init_ex(int argc, char** argv, const char* resources_dir,
                        const char* locales_dir, const char* cache_dir,
                        int windowless, int external_pump) {
@@ -994,6 +1027,15 @@ int cinder_cef_init_ex(int argc, char** argv, const char* resources_dir,
     return 0;
   }
   trace("init done", 0, 0);
+#ifdef __APPLE__
+  /* AppKit's run loop is owned by the host (winit), and pumping CEF from
+   * inside a host callback re-enters that host's event handler. A run loop
+   * timer fires between host callbacks instead, so CEF advances without
+   * re-entering anything. */
+  if (external_pump) {
+    install_pump_timer();
+  }
+#endif
   return 1;
 }
 

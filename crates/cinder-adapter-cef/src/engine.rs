@@ -150,6 +150,12 @@ pub struct CefEngineConfig {
     /// which re-enters the host's event handler, so CEF drives itself from the
     /// run loop instead and [`Engine::pump`] does nothing.
     pub external_pump: bool,
+    /// Whether this process pumps CEF from its own event loop.
+    ///
+    /// False on macOS, where the shim drives `cef_do_message_loop_work` from a
+    /// run loop timer: pumping from inside the host's callback would re-enter
+    /// the host's event handler.
+    pub host_pumps: bool,
     /// What this build actually provides. Defaults to [`measured_capabilities`].
     pub capabilities: Capabilities,
 }
@@ -169,6 +175,7 @@ impl CefEngineConfig {
             windowless: true,
             main_thread: default_main_thread(),
             external_pump: default_external_pump(),
+            host_pumps: default_host_pumps(),
             capabilities: measured_capabilities(),
         }
     }
@@ -189,6 +196,15 @@ pub fn default_main_thread() -> bool {
 /// overrides it so either mode can be exercised on any platform.
 pub fn default_external_pump() -> bool {
     match std::env::var("CINDER_CEF_EXTERNAL_PUMP") {
+        Ok(value) => value != "0",
+        Err(_) => true,
+    }
+}
+
+/// Whether this process pumps CEF itself. `CINDER_CEF_HOST_PUMP=0|1` overrides
+/// it so either mode can be exercised on any platform.
+pub fn default_host_pumps() -> bool {
+    match std::env::var("CINDER_CEF_HOST_PUMP") {
         Ok(value) => value != "0",
         Err(_) => !cfg!(target_os = "macos"),
     }
@@ -709,6 +725,8 @@ struct EngineCore {
     /// Whether this core has to pump CEF itself; see
     /// [`CefEngineConfig::external_pump`].
     external_pump: bool,
+    /// Whether this core pumps CEF itself; see [`CefEngineConfig::host_pumps`].
+    host_pumps: bool,
 }
 
 // SAFETY: a core is only ever touched by the thread that initialized CEF —
@@ -746,11 +764,12 @@ impl EngineCore {
             ids: IdAllocator::new(),
             state: EngineState::default(),
             external_pump: config.external_pump,
+            host_pumps: config.host_pumps,
         })
     }
 
     fn pump(&mut self) {
-        if self.external_pump {
+        if self.external_pump && self.host_pumps {
             self.cef.pump(PUMP_MS);
         }
         reconcile(&mut self.state, &self.sink);
