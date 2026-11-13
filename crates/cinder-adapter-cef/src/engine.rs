@@ -115,8 +115,37 @@ mod ffi {
 }
 
 /// How long one `pump` slice runs before commands are serviced again.
-const PUMP_MS: u32 = 5;
-/// How long `execute` waits for the engine thread to accept a command.
+/// Marks the engine core as busy on this thread.
+///
+/// Pumping CEF runs the platform message loop, which can re-enter the host's
+/// window procedure and call back into the engine. The core mutex is not
+/// reentrant, so a nested call would deadlock; it is refused instead.
+struct CoreBusy;
+
+thread_local! {
+    static IN_CORE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+impl CoreBusy {
+    fn enter() -> Option<Self> {
+        IN_CORE.with(|flag| {
+            if flag.get() {
+                None
+            } else {
+                flag.set(true);
+                Some(Self)
+            }
+        })
+    }
+}
+
+impl Drop for CoreBusy {
+    fn drop(&mut self) {
+        IN_CORE.with(|flag| flag.set(false));
+    }
+}
+
+const PUMP_MS: u32 = 5;/// How long `execute` waits for the engine thread to accept a command.
 const ACCEPT_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long view creation waits for CEF's `on_after_created`.
 const CREATE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -555,6 +584,12 @@ impl CefEngine {
             command,
             ack: ack_tx,
         };
+        // Pumping CEF runs the platform message loop, which can re-enter the
+        // host's window procedure and call back into the engine. The core mutex
+        // is not reentrant, so a nested call is refused instead of deadlocking.
+        let Some(_busy) = CoreBusy::enter() else {
+            return Err(AdapterError::EngineFault("engine re-entered".into()));
+        };
         let mut guard = self.core.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(core) = guard.as_mut() {
             core.pump();
@@ -594,6 +629,7 @@ impl CefEngine {
     ) -> Option<T> {
         let (ack_tx, ack_rx) = channel();
         let request = make(ack_tx);
+        let _busy = CoreBusy::enter()?;
         let mut guard = self.core.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(core) = guard.as_mut() {
             core.pump();
@@ -610,6 +646,9 @@ impl CefEngine {
     /// Advance CEF by one slice when the engine runs inline. A no-op when the
     /// engine owns a thread, which pumps itself.
     pub fn pump(&self) {
+        let Some(_busy) = CoreBusy::enter() else {
+            return;
+        };
         if let Some(core) = self
             .core
             .lock()
