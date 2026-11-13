@@ -183,9 +183,27 @@ pub fn root_name(input: &BundleInput<'_>) -> String {
     format!("cinder-{}-{}", input.version, input.target.triple)
 }
 
+/// CEF keeps `icudtl.dat`, the pak files and `locales/` in `Resources/` on both
+/// Linux and Windows; older builds put them beside `libcef.so` in `Release/`.
+/// Look in `Resources/` first and fall back, so either layout is packaged.
+fn resource(input: &BundleInput<'_>, name: &str) -> Option<PathBuf> {
+    let in_resources = input.cef_root.join("Resources").join(name);
+    if in_resources.exists() {
+        return Some(in_resources);
+    }
+    let in_release = input.cef_root.join("Release").join(name);
+    in_release.exists().then_some(in_release)
+}
+
+fn locale_dir(input: &BundleInput<'_>) -> Option<PathBuf> {
+    ["Resources", "Release"]
+        .iter()
+        .map(|dir| input.cef_root.join(dir).join("locales"))
+        .find(|path| path.is_dir())
+}
+
 pub fn linux_entries(input: &BundleInput<'_>) -> io::Result<Vec<Entry>> {
     let root = root_name(input);
-    let release = input.cef_root.join("Release");
     let mut out = vec![Entry::dir(root.clone(), 0o755)];
 
     for bin in ["cinder", "cef-spike"] {
@@ -200,18 +218,17 @@ pub fn linux_entries(input: &BundleInput<'_>) -> io::Result<Vec<Entry>> {
         0o755,
     ));
     for name in LINUX_RUNTIME.iter().filter(|n| **n != "libcef.so") {
-        let src = release.join(name);
-        if src.exists() {
-            let mode = if name.ends_with(".so") || *name == "chrome-sandbox" {
-                0o755
-            } else {
-                0o644
-            };
-            out.push(Entry::file(format!("{root}/{name}"), src, mode));
-        }
+        let Some(src) = resource(input, name) else {
+            continue;
+        };
+        let mode = if name.ends_with(".so") || *name == "chrome-sandbox" {
+            0o755
+        } else {
+            0o644
+        };
+        out.push(Entry::file(format!("{root}/{name}"), src, mode));
     }
-    let locale_dir = release.join("locales");
-    if locale_dir.is_dir() {
+    if let Some(locale_dir) = locale_dir(input) {
         out.push(Entry::dir(format!("{root}/locales"), 0o755));
         for pak in locales(&locale_dir)? {
             let name = pak.file_name().unwrap().to_string_lossy().into_owned();
@@ -224,8 +241,6 @@ pub fn linux_entries(input: &BundleInput<'_>) -> io::Result<Vec<Entry>> {
 
 pub fn windows_entries(input: &BundleInput<'_>) -> io::Result<Vec<Entry>> {
     let root = root_name(input);
-    let release = input.cef_root.join("Release");
-    let resources = input.cef_root.join("Resources");
     let mut out = vec![Entry::dir(root.clone(), 0o755)];
 
     for bin in ["cinder", "cef-spike"] {
@@ -239,19 +254,18 @@ pub fn windows_entries(input: &BundleInput<'_>) -> io::Result<Vec<Entry>> {
         }
     }
     for name in WINDOWS_RELEASE {
-        let src = release.join(name);
-        if src.exists() {
-            out.push(Entry::file(format!("{root}/{name}"), src, 0o644));
-        }
+        let Some(src) = resource(input, name) else {
+            continue;
+        };
+        out.push(Entry::file(format!("{root}/{name}"), src, 0o644));
     }
     for name in WINDOWS_RESOURCES {
-        let src = resources.join(name);
-        if src.exists() {
-            out.push(Entry::file(format!("{root}/{name}"), src, 0o644));
-        }
+        let Some(src) = resource(input, name) else {
+            continue;
+        };
+        out.push(Entry::file(format!("{root}/{name}"), src, 0o644));
     }
-    let locale_dir = resources.join("locales");
-    if locale_dir.is_dir() {
+    if let Some(locale_dir) = locale_dir(input) {
         out.push(Entry::dir(format!("{root}/locales"), 0o755));
         for pak in locales(&locale_dir)? {
             let name = pak.file_name().unwrap().to_string_lossy().into_owned();
