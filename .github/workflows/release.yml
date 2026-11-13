@@ -160,6 +160,8 @@ jobs:
           if (-not (Test-Path (Join-Path $root 'cinder.exe'))) {
             throw "staged bundle has no cinder.exe"
           }
+          $staged = (Get-ChildItem $root -Recurse -File).Count
+          Write-Host "staged bundle: $staged files under $root"
 
           $wix = 'C:\Program Files (x86)\WiX Toolset v3.14\bin'
           if (-not (Test-Path "$wix\candle.exe")) { throw "WiX 3 not found at $wix" }
@@ -189,19 +191,23 @@ jobs:
           $installer = New-Object -ComObject WindowsInstaller.Installer
           $db = $installer.GetType().InvokeMember('OpenDatabase', 'InvokeMethod', $null,
             $installer, @((Resolve-Path $msi).Path, 0))
+          # Column 1 is the File key (heat's generated `fil<GUID>` identifier),
+          # column 2 is the actual name, which may be `SHORT|LONG`.
           $view = $db.GetType().InvokeMember('OpenView', 'InvokeMethod', $null, $db,
-            @('SELECT `File` FROM `File`'))
+            @('SELECT `File`,`FileName` FROM `File`'))
           $view.GetType().InvokeMember('Execute', 'InvokeMethod', $null, $view, $null)
           $names = @()
           while ($true) {
             $row = $view.GetType().InvokeMember('Fetch', 'InvokeMethod', $null, $view, $null)
             if ($null -eq $row) { break }
-            $names += $row.GetType().InvokeMember('StringData', 'GetProperty', $null, $row, @(1))
+            $name = $row.GetType().InvokeMember('StringData', 'GetProperty', $null, $row, @(2))
+            $names += ($name -split '\|')[-1]
           }
           Write-Host "MSI File table: $($names.Count) entries"
+          Write-Host "  $($names -join ', ')"
           if ($names.Count -eq 0) { throw "MSI File table is empty: heat harvested nothing" }
-          if (-not ($names -match '^cinder\.exe$')) {
-            throw "MSI File table has no cinder.exe (first entries: $($names[0..4] -join ', '))"
+          if (-not ($names -match '^(?i)cinder\.exe$')) {
+            throw "MSI File table has no cinder.exe"
           }
 
           # Then the real thing: an administrative install unpacks every file
