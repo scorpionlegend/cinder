@@ -193,6 +193,11 @@ pub struct CefEngineConfig {
     /// run loop timer: pumping from inside the host's callback would re-enter
     /// the host's event handler.
     pub host_pumps: bool,
+    /// Whether a command may pump CEF inline, i.e. block until CEF reports the
+    /// browser. Only Linux may: on Windows and macOS pumping from inside the
+    /// host's event callback runs a nested platform message loop that never
+    /// returns.
+    pub pump_in_send: bool,
     /// What this build actually provides. Defaults to [`measured_capabilities`].
     pub capabilities: Capabilities,
 }
@@ -213,6 +218,7 @@ impl CefEngineConfig {
             main_thread: default_main_thread(),
             external_pump: default_external_pump(),
             host_pumps: default_host_pumps(),
+            pump_in_send: default_pump_in_send(),
             capabilities: measured_capabilities(),
         }
     }
@@ -244,6 +250,15 @@ pub fn default_host_pumps() -> bool {
     match std::env::var("CINDER_CEF_HOST_PUMP") {
         Ok(value) => value != "0",
         Err(_) => !cfg!(target_os = "macos"),
+    }
+}
+
+/// Whether a command may pump CEF inline. `CINDER_CEF_PUMP_IN_SEND=0|1`
+/// overrides it so either mode can be exercised on any platform.
+pub fn default_pump_in_send() -> bool {
+    match std::env::var("CINDER_CEF_PUMP_IN_SEND") {
+        Ok(value) => value != "0",
+        Err(_) => cfg!(target_os = "linux"),
     }
 }
 
@@ -602,7 +617,9 @@ impl CefEngine {
         let mut guard = self.core.lock().unwrap_or_else(|e| e.into_inner());
         trace("send locked");
         if let Some(core) = guard.as_mut() {
-            core.pump();
+            if core.pump_in_send {
+                core.pump();
+            }
             trace("send pumped");
             let alive = core.serve(request);
             trace("send served");
@@ -778,6 +795,9 @@ struct EngineCore {
     external_pump: bool,
     /// Whether this core pumps CEF itself; see [`CefEngineConfig::host_pumps`].
     host_pumps: bool,
+    /// Whether a command may pump inline; see
+    /// [`CefEngineConfig::pump_in_send`].
+    pump_in_send: bool,
 }
 
 // SAFETY: a core is only ever touched by the thread that initialized CEF —
@@ -815,6 +835,7 @@ impl EngineCore {
             ids: IdAllocator::new(),
             state: EngineState::default(),
             external_pump: config.external_pump,
+            pump_in_send: config.pump_in_send,
             host_pumps: config.host_pumps,
         })
     }
@@ -832,7 +853,7 @@ impl EngineCore {
             EngineRequest::Command { command, ack } => {
                 if matches!(command, Command::Shutdown) {
                     let result =
-                        shutdown_views(&self.cef, &mut self.state, &self.sink, self.host_pumps);
+                        shutdown_views(&self.cef, &mut self.state, &self.sink, self.pump_in_send);
                     let _ = ack.send(result);
                     return false;
                 }
@@ -842,7 +863,7 @@ impl EngineCore {
                     &self.sink,
                     &self.ids,
                     command,
-                    self.host_pumps,
+                    self.pump_in_send,
                 );
                 let _ = ack.send(result);
             }
@@ -1042,7 +1063,7 @@ fn shutdown_views(
     cef: &Cef,
     state: &mut EngineState,
     sink: &EventSink,
-    host_pumps: bool,
+    inline_pump: bool,
 ) -> Result<CommandOutcome, AdapterError> {
     let open: Vec<ViewId> = state
         .views
@@ -1060,7 +1081,7 @@ fn shutdown_views(
 
     let deadline = Instant::now() + CLOSE_TIMEOUT;
     while Instant::now() < deadline {
-        if host_pumps {
+        if inline_pump {
             cef.pump(PUMP_MS);
         }
         reconcile(state, sink);
@@ -1094,7 +1115,7 @@ fn handle(
     sink: &EventSink,
     ids: &IdAllocator,
     command: Command,
-    host_pumps: bool,
+    inline_pump: bool,
 ) -> Result<CommandOutcome, AdapterError> {
     match command {
         Command::Shutdown => Ok(CommandOutcome::Done),
@@ -1166,7 +1187,7 @@ fn handle(
             // macOS, which re-enters the host's event handler. Where the host
             // does not pump, the view is reported as created straight away and
             // the run loop timer promotes it once CEF reports the browser.
-            if !host_pumps {
+            if !inline_pump {
                 return Ok(CommandOutcome::ViewCreated(view));
             }
             if !wait_for_created(cef, raw) {

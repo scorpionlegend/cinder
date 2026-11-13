@@ -68,7 +68,7 @@ pub const EV_BLOCKED: i32 = 10;
 mod engine;
 mod runtime;
 
-pub use engine::{default_external_pump, default_host_pumps, default_main_thread, measured_capabilities, CefEngine, CefEngineConfig, InputEvent, KeyKind, MouseButton};
+pub use engine::{default_external_pump, default_host_pumps, default_main_thread, default_pump_in_send, measured_capabilities, CefEngine, CefEngineConfig, InputEvent, KeyKind, MouseButton};
 pub use runtime::{prepare as prepare_runtime, root as cef_root, stage as stage_runtime};
 
 #[derive(Debug, Clone, PartialEq, Eq)]

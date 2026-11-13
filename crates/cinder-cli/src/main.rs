@@ -103,6 +103,7 @@ fn run_probe(name: &str) -> i32 {
         main_thread: cinder_adapter_cef::default_main_thread(),
         external_pump: cinder_adapter_cef::default_external_pump(),
         host_pumps: cinder_adapter_cef::default_host_pumps(),
+        pump_in_send: cinder_adapter_cef::default_pump_in_send(),
         capabilities: cinder_adapter_cef::measured_capabilities(),
     };
     match name {
@@ -443,6 +444,7 @@ fn run_browse(target: Option<&str>) -> i32 {
         // This path has no event loop to re-enter, so it pumps CEF itself even
         // where the windowed path leaves that to the platform run loop.
         host_pumps: true,
+        pump_in_send: true,
         capabilities: cinder_adapter_cef::measured_capabilities(),
     };
     println!("web engine : CEF {}", cinder_adapter_cef::Cef::version());
@@ -597,6 +599,7 @@ fn run_open(target: Option<&str>) -> i32 {    use std::cell::RefCell;
         main_thread: cinder_adapter_cef::default_main_thread(),
         external_pump: cinder_adapter_cef::default_external_pump(),
         host_pumps: cinder_adapter_cef::default_host_pumps(),
+        pump_in_send: cinder_adapter_cef::default_pump_in_send(),
         capabilities: cinder_adapter_cef::measured_capabilities(),
     };
 
