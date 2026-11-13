@@ -90,7 +90,7 @@ fn main() {
 /// tell a thread-affinity problem apart from a settings or GPU problem.
 #[cfg(feature = "cef")]
 fn run_probe(name: &str) -> i32 {
-    use cinder_adapter_cef::{Cef, CefEngine, CefEngineConfig};
+    use cinder_adapter_cef::{CefEngine, CefEngineConfig};
 
     let staged = cinder_adapter_cef::prepare_runtime(&cinder_adapter_cef::cef_root());
     let cache = std::env::temp_dir().join("cinder-probe-cache");
@@ -100,31 +100,15 @@ fn run_probe(name: &str) -> i32 {
         cache_dir: cache,
         extra_args: window_args(),
         windowless: false,
+        main_thread: cinder_adapter_cef::default_main_thread(),
         capabilities: cinder_adapter_cef::measured_capabilities(),
     };
     match name {
-        // CEF documents the main thread as the only valid one to initialize on.
-        "main" | "main-windowless" => {
-            let windowless = name == "main-windowless";
-            match Cef::init_with_args_mode(
-                &config.resources_dir,
-                &config.locales_dir,
-                &config.cache_dir,
-                &config.extra_args,
-                windowless,
-            ) {
-                Ok(_) => {
-                    println!("probe {name}: init ok");
-                    0
-                }
-                Err(e) => {
-                    println!("probe {name}: init failed: {e}");
-                    1
-                }
-            }
-        }
-        "thread" | "thread-windowless" | "single" | "inproc" => {
-            config.windowless = name == "thread-windowless";
+        // `main` initializes on this thread, `thread` on a dedicated one; the
+        // rest vary windowless rendering, single-process and the GPU process.
+        "main" | "main-windowless" | "thread" | "thread-windowless" | "single" | "inproc" => {
+            config.windowless = name.ends_with("windowless");
+            config.main_thread = name.starts_with("main");
             match name {
                 "single" => config.extra_args.push("--single-process".into()),
                 "inproc" => config.extra_args.push("--in-process-gpu".into()),
@@ -452,6 +436,7 @@ fn run_browse(target: Option<&str>) -> i32 {
             "--ozone-platform=headless".into(),
         ],
         windowless: true,
+        main_thread: cinder_adapter_cef::default_main_thread(),
         capabilities: cinder_adapter_cef::measured_capabilities(),
     };
     println!("web engine : CEF {}", cinder_adapter_cef::Cef::version());
@@ -591,6 +576,7 @@ fn run_open(target: Option<&str>) -> i32 {
         // disabling it leaves every frame black.
         extra_args: window_args(),
         windowless: false,
+        main_thread: cinder_adapter_cef::default_main_thread(),
         capabilities: cinder_adapter_cef::measured_capabilities(),
     };
 

@@ -69,6 +69,7 @@ impl Collector {
 
     fn pump(
         &mut self,
+        engine: &CefEngine,
         stream: &EventStream,
         timeout: Duration,
         pred: impl Fn(&Event) -> bool,
@@ -81,6 +82,8 @@ impl Collector {
             if Instant::now() >= deadline {
                 return false;
             }
+            // Inline engines only advance when their own thread pumps.
+            engine.pump();
             if let Ok(message) = stream.recv_timeout(Duration::from_millis(50)) {
                 if let Some(envelope) = message.event() {
                     self.events.push(envelope.event.clone());
@@ -112,6 +115,7 @@ fn config() -> CefEngineConfig {
             format!("--user-data-dir={}", cache.display()),
         ],
         windowless: true,
+        main_thread: cinder_adapter_cef::default_main_thread(),
         capabilities: cinder_adapter_cef::measured_capabilities(),
     }
 }
@@ -135,7 +139,7 @@ fn run() -> Vec<String> {
 
     let mut events = Collector::new();
     check.that(
-        events.pump(&stream, Duration::from_secs(10), |e| {
+        events.pump(&engine, &stream, Duration::from_secs(10), |e| {
             matches!(e, Event::EngineInitialized { .. })
         }),
         "EngineInitialized arrives",
@@ -192,25 +196,25 @@ fn run() -> Vec<String> {
     check.that(true, format!("CreateView returns {view}"));
 
     check.that(
-        events.pump(&stream, Duration::from_secs(20), |e| {
+        events.pump(&engine, &stream, Duration::from_secs(20), |e| {
             matches!(e, Event::ViewReady { .. })
         }),
         "ViewReady arrives",
     );
     check.that(
-        events.pump(&stream, Duration::from_secs(20), |e| {
+        events.pump(&engine, &stream, Duration::from_secs(20), |e| {
             matches!(e, Event::LoadFinished { .. })
         }),
         "LoadFinished arrives for the file: page",
     );
     check.that(
-        events.pump(&stream, Duration::from_secs(10), |e| {
+        events.pump(&engine, &stream, Duration::from_secs(10), |e| {
             matches!(e, Event::TitleChanged { title, .. } if title.contains("Cinder Engine E2E"))
         }),
         "TitleChanged carries the page title",
     );
     check.that(
-        events.pump(&stream, Duration::from_secs(10), |e| {
+        events.pump(&engine, &stream, Duration::from_secs(10), |e| {
             matches!(e, Event::UrlChanged { url, .. } if url.as_str().starts_with("file://"))
         }),
         "UrlChanged reports the loaded URL",
@@ -279,7 +283,7 @@ fn run() -> Vec<String> {
         // The first real network request waits for Chromium's network service
         // to come up, which takes ~25 s in this sandbox; later requests are
         // immediate. The timeout covers that one-time startup, not the block.
-        events.pump(&stream, Duration::from_secs(60), |e| {
+        events.pump(&engine, &stream, Duration::from_secs(60), |e| {
             matches!(
                 e,
                 Event::LoadFailed {
@@ -315,7 +319,7 @@ fn run() -> Vec<String> {
         "CloseView is accepted",
     );
     check.that(
-        events.pump(&stream, Duration::from_secs(20), |e| {
+        events.pump(&engine, &stream, Duration::from_secs(20), |e| {
             matches!(e, Event::ViewClosed { .. })
         }),
         "ViewClosed arrives",
@@ -332,7 +336,7 @@ fn run() -> Vec<String> {
 
     check.that(engine.shutdown().is_ok(), "shutdown returns Ok");
     check.that(
-        events.pump(&stream, Duration::from_secs(10), |e| {
+        events.pump(&engine, &stream, Duration::from_secs(10), |e| {
             matches!(e, Event::ShutdownComplete)
         }),
         "ShutdownComplete arrives",

@@ -825,12 +825,12 @@ int cinder_cef_execute_process(int argc, char** argv) {
 
 int cinder_cef_init(int argc, char** argv, const char* resources_dir,
                     const char* locales_dir, const char* cache_dir) {
-  return cinder_cef_init_ex(argc, argv, resources_dir, locales_dir, cache_dir, 1);
+  return cinder_cef_init_ex(argc, argv, resources_dir, locales_dir, cache_dir, 1, 0);
 }
 
 int cinder_cef_init_ex(int argc, char** argv, const char* resources_dir,
                        const char* locales_dir, const char* cache_dir,
-                       int windowless) {
+                       int windowless, int external_pump) {
   cef_main_args_t args;
   cef_settings_t settings;
 
@@ -840,6 +840,10 @@ int cinder_cef_init_ex(int argc, char** argv, const char* resources_dir,
   settings.size = sizeof(cef_settings_t);
   settings.no_sandbox = 1;
   settings.windowless_rendering_enabled = windowless ? 1 : 0;
+  /* cef_do_message_loop_work() is only defined when the host owns the loop.
+   * Without this, CEF expects cef_run_message_loop() and the pump is a no-op
+   * on some platforms. */
+  settings.external_message_pump = external_pump ? 1 : 0;
   settings.log_severity = LOGSEVERITY_WARNING;
   settings.background_color = 0xFFFFFFFFu;
   if (resources_dir) {

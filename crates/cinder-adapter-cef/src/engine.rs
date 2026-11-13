@@ -136,6 +136,13 @@ pub struct CefEngineConfig {
     /// Whether this process paints off-screen. A windowed shell sets this to
     /// `false` so CEF creates native child windows instead.
     pub windowless: bool,
+    /// Run CEF on the calling thread instead of a dedicated one.
+    ///
+    /// Chromium binds its browser UI thread to the process's main thread on
+    /// macOS and Windows; initializing anywhere else leaves every later call on
+    /// an "Unknown Thread" and trips a `CHECK` inside the first pump. Linux has
+    /// no such binding, so it keeps the dedicated thread.
+    pub main_thread: bool,
     /// What this build actually provides. Defaults to [`measured_capabilities`].
     pub capabilities: Capabilities,
 }
@@ -153,8 +160,20 @@ impl CefEngineConfig {
             cache_dir: cache,
             extra_args: Vec::new(),
             windowless: true,
+            main_thread: default_main_thread(),
             capabilities: measured_capabilities(),
         }
+    }
+}
+
+/// Whether CEF has to run on the caller's thread on this platform.
+///
+/// `CINDER_CEF_MAIN_THREAD=1` forces the inline path and `=0` the threaded one,
+/// so either can be exercised on any platform.
+pub fn default_main_thread() -> bool {
+    match std::env::var("CINDER_CEF_MAIN_THREAD") {
+        Ok(value) => value != "0",
+        Err(_) => !cfg!(target_os = "linux"),
     }
 }
 
@@ -435,8 +454,11 @@ impl EngineState {
 
 /// A CEF-backed engine. One per process: CEF permits a single initialization.
 pub struct CefEngine {
-    tx: Mutex<Sender<EngineRequest>>,
+    /// Command channel to the engine thread. `None` when CEF runs inline.
+    tx: Mutex<Option<Sender<EngineRequest>>>,
     rx: Mutex<Option<Receiver<EngineMessage>>>,
+    /// The CEF session, owned here when [`CefEngineConfig::main_thread`] is set.
+    core: Mutex<Option<EngineCore>>,
     capabilities: Capabilities,
     closed: AtomicBool,
     join: Mutex<Option<JoinHandle<()>>>,
@@ -456,10 +478,22 @@ impl CefEngine {
     /// fails, so a broken runtime is reported here rather than on first use.
     pub fn new(config: CefEngineConfig) -> Result<Self, CefError> {
         let (event_tx, event_rx) = channel();
+        let capabilities = config.capabilities;
+
+        if config.main_thread {
+            let core = EngineCore::start(&config, event_tx)?;
+            return Ok(Self {
+                tx: Mutex::new(None),
+                rx: Mutex::new(Some(event_rx)),
+                core: Mutex::new(Some(core)),
+                capabilities,
+                closed: AtomicBool::new(false),
+                join: Mutex::new(None),
+            });
+        }
+
         let (cmd_tx, cmd_rx) = channel();
         let (init_tx, init_rx) = channel();
-
-        let capabilities = config.capabilities;
         let join = std::thread::Builder::new()
             .name("cinder-cef".into())
             .spawn(move || run_engine(config, cmd_rx, event_tx, init_tx))
@@ -467,8 +501,9 @@ impl CefEngine {
 
         match init_rx.recv_timeout(Duration::from_secs(60)) {
             Ok(Ok(())) => Ok(Self {
-                tx: Mutex::new(cmd_tx),
+                tx: Mutex::new(Some(cmd_tx)),
                 rx: Mutex::new(Some(event_rx)),
+                core: Mutex::new(None),
                 capabilities,
                 closed: AtomicBool::new(false),
                 join: Mutex::new(Some(join)),
@@ -483,14 +518,33 @@ impl CefEngine {
 
     fn send(&self, command: Command) -> Result<CommandOutcome, AdapterError> {
         let (ack_tx, ack_rx) = channel();
-        self.tx
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .send(EngineRequest::Command {
-                command,
-                ack: ack_tx,
-            })
+        let request = EngineRequest::Command {
+            command,
+            ack: ack_tx,
+        };
+        let mut guard = self.core.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(core) = guard.as_mut() {
+            core.pump();
+            let alive = core.serve(request);
+            let result = ack_rx.recv_timeout(ACCEPT_TIMEOUT).unwrap_or_else(|_| {
+                Err(AdapterError::EngineFault(
+                    "engine did not accept the command".into(),
+                ))
+            });
+            if !alive {
+                if let Some(core) = guard.take() {
+                    core.finish();
+                }
+            }
+            return result;
+        }
+        drop(guard);
+        let tx = self.tx.lock().unwrap_or_else(|e| e.into_inner());
+        tx.as_ref()
+            .ok_or_else(|| AdapterError::EngineFault("engine is shut down".into()))?
+            .send(request)
             .map_err(|_| AdapterError::EngineFault("engine thread is gone".into()))?;
+        drop(tx);
         match ack_rx.recv_timeout(ACCEPT_TIMEOUT) {
             Ok(result) => result,
             Err(_) => Err(AdapterError::EngineFault(
@@ -499,19 +553,45 @@ impl CefEngine {
         }
     }
 
+    /// Run one read-only request, inline or over the engine thread's channel.
+    fn request<T>(
+        &self,
+        make: impl FnOnce(Sender<T>) -> EngineRequest,
+        timeout: Duration,
+    ) -> Option<T> {
+        let (ack_tx, ack_rx) = channel();
+        let request = make(ack_tx);
+        let mut guard = self.core.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(core) = guard.as_mut() {
+            core.pump();
+            core.serve(request);
+            return ack_rx.recv_timeout(timeout).ok();
+        }
+        drop(guard);
+        let tx = self.tx.lock().unwrap_or_else(|e| e.into_inner());
+        tx.as_ref()?.send(request).ok()?;
+        drop(tx);
+        ack_rx.recv_timeout(timeout).ok()
+    }
+
+    /// Advance CEF by one slice when the engine runs inline. A no-op when the
+    /// engine owns a thread, which pumps itself.
+    pub fn pump(&self) {
+        if let Some(core) = self
+            .core
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+        {
+            core.pump();
+        }
+    }
+
     /// The view's current URL, as last reported by CEF's address change.
     /// Returns `None` before the first navigation.
     pub fn view_url(&self, view: ViewId) -> Option<String> {
-        let (ack_tx, ack_rx) = channel();
-        self.tx
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .send(EngineRequest::Url {
-                view,
-                ack: ack_tx,
-            })
-            .ok()?;
-        ack_rx.recv_timeout(FRAME_TIMEOUT).ok().flatten()
+        self.request(|ack| EngineRequest::Url { view, ack }, FRAME_TIMEOUT)
+            .flatten()
     }
 
     /// Whether the view's history has an entry behind it.
@@ -525,54 +605,34 @@ impl CefEngine {
     }
 
     fn history(&self, view: ViewId, back: bool) -> bool {
-        let (ack_tx, ack_rx) = channel();
-        self.tx
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .send(EngineRequest::History {
-                view,
-                back,
-                ack: ack_tx,
-            })
-            .ok();
-        ack_rx.recv_timeout(FRAME_TIMEOUT).ok().unwrap_or(false)
+        self.request(
+            |ack| EngineRequest::History { view, back, ack },
+            FRAME_TIMEOUT,
+        )
+        .unwrap_or(false)
     }
 
     /// Copy the view's last painted frame. Returns `None` before the first
     /// paint or once the view is gone.
     pub fn copy_frame(&self, view: ViewId) -> Option<Frame> {
-        let (ack_tx, ack_rx) = channel();
-        self.tx
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .send(EngineRequest::Frame {
-                view,
-                ack: ack_tx,
-            })
-            .ok()?;
-        ack_rx.recv_timeout(FRAME_TIMEOUT).ok().flatten()
+        self.request(|ack| EngineRequest::Frame { view, ack }, FRAME_TIMEOUT)
+            .flatten()
     }
 
     /// Forward one input event. Returns false if the view is unknown.
     pub fn send_input(&self, view: ViewId, event: InputEvent) -> bool {
-        let (ack_tx, ack_rx) = channel();
-        let sent = self
-            .tx
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .send(EngineRequest::Input {
-                view,
-                event,
-                ack: ack_tx,
-            })
-            .is_ok();
-        sent && ack_rx.recv_timeout(FRAME_TIMEOUT).unwrap_or(false)
+        self.request(|ack| EngineRequest::Input { view, event, ack }, FRAME_TIMEOUT)
+            .unwrap_or(false)
     }
 }
 
 impl Engine for CefEngine {
     fn capabilities(&self) -> Capabilities {
         self.capabilities
+    }
+
+    fn pump(&self) {
+        CefEngine::pump(self)
     }
 
     fn execute(&self, command: Command) -> Result<CommandOutcome, AdapterError> {
@@ -622,72 +682,111 @@ impl Drop for CefEngine {
     }
 }
 
+/// The live CEF session: everything one thread needs to drive CEF.
+struct EngineCore {
+    cef: Cef,
+    sink: Arc<EventSink>,
+    sink_ptr: *mut c_void,
+    ids: IdAllocator,
+    state: EngineState,
+}
+
+// SAFETY: a core is only ever touched by the thread that initialized CEF —
+// either the dedicated engine thread or the caller's own thread.
+unsafe impl Send for EngineCore {}
+
+impl EngineCore {
+    fn start(config: &CefEngineConfig, event_tx: Sender<EngineMessage>) -> Result<Self, CefError> {
+        let cef = Cef::init_with_args_mode_ex(
+            &config.resources_dir,
+            &config.locales_dir,
+            &config.cache_dir,
+            &config.extra_args,
+            config.windowless,
+            config.main_thread,
+        )?;
+
+        let sink = Arc::new(EventSink::new(event_tx));
+        let sink_ptr = Arc::into_raw(Arc::clone(&sink)) as *mut c_void;
+        // SAFETY: the pointer stays valid until the matching `from_raw` in
+        // `finish`, which happens after CEF has shut down and stopped calling
+        // back.
+        unsafe { ffi::cinder_cef_set_event_callback(Some(on_cef_event), sink_ptr) };
+
+        sink.emit(
+            None,
+            Event::EngineInitialized {
+                engine_version: Cef::version(),
+            },
+        );
+        Ok(Self {
+            cef,
+            sink,
+            sink_ptr,
+            ids: IdAllocator::new(),
+            state: EngineState::default(),
+        })
+    }
+
+    fn pump(&mut self) {
+        self.cef.pump(PUMP_MS);
+        reconcile(&mut self.state, &self.sink);
+    }
+
+    /// Handle one request. Returns false once the session has shut down.
+    fn serve(&mut self, request: EngineRequest) -> bool {
+        match request {
+            EngineRequest::Command { command, ack } => {
+                if matches!(command, Command::Shutdown) {
+                    let result = shutdown_views(&self.cef, &mut self.state, &self.sink);
+                    let _ = ack.send(result);
+                    return false;
+                }
+                let result = handle(&self.cef, &mut self.state, &self.sink, &self.ids, command);
+                let _ = ack.send(result);
+            }
+            EngineRequest::Frame { view, ack } => {
+                let _ = ack.send(read_frame(view));
+            }
+            EngineRequest::Input { view, event, ack } => {
+                let _ = ack.send(apply_input(view, event));
+            }
+            EngineRequest::Url { view, ack } => {
+                let _ = ack.send(read_url(view));
+            }
+            EngineRequest::History { view, back, ack } => {
+                let _ = ack.send(read_history(view, back));
+            }
+        }
+        true
+    }
+
+    fn finish(self) {
+        finish(&self.cef, &self.sink, self.sink_ptr);
+    }
+}
+
 fn run_engine(
     config: CefEngineConfig,
     cmd_rx: Receiver<EngineRequest>,
     event_tx: Sender<EngineMessage>,
     init_tx: Sender<Result<(), String>>,
 ) {
-    let cef = Cef::init_with_args_mode(
-        &config.resources_dir,
-        &config.locales_dir,
-        &config.cache_dir,
-        &config.extra_args,
-        config.windowless,
-    );
-    let cef = match cef {
-        Ok(cef) => cef,
+    let mut core = match EngineCore::start(&config, event_tx) {
+        Ok(core) => core,
         Err(e) => {
             let _ = init_tx.send(Err(e.to_string()));
             return;
         }
     };
-
-    let sink = Arc::new(EventSink::new(event_tx));
-    let sink_ptr = Arc::into_raw(Arc::clone(&sink)) as *mut c_void;
-    // SAFETY: the pointer stays valid until the matching `from_raw` below,
-    // which happens after CEF has shut down and stopped calling back.
-    unsafe { ffi::cinder_cef_set_event_callback(Some(on_cef_event), sink_ptr) };
-
-    sink.emit(
-        None,
-        Event::EngineInitialized {
-            engine_version: Cef::version(),
-        },
-    );
     let _ = init_tx.send(Ok(()));
 
-    let ids = IdAllocator::new();
-    let mut state = EngineState::default();
-
     loop {
-        cef.pump(PUMP_MS);
-        reconcile(&mut state, &sink);
-
+        core.pump();
         while let Ok(request) = cmd_rx.try_recv() {
-            match request {
-                EngineRequest::Command { command, ack } => {
-                    if matches!(command, Command::Shutdown) {
-                        let result = shutdown_views(&cef, &mut state, &sink);
-                        let _ = ack.send(result);
-                        finish(&cef, &sink, sink_ptr);
-                        return;
-                    }
-                    let result = handle(&cef, &mut state, &sink, &ids, command);
-                    let _ = ack.send(result);
-                }
-                EngineRequest::Frame { view, ack } => {
-                    let _ = ack.send(read_frame(view));
-                }
-                EngineRequest::Input { view, event, ack } => {
-                    let _ = ack.send(apply_input(view, event));
-                }
-                EngineRequest::Url { view, ack } => {
-                    let _ = ack.send(read_url(view));
-                }
-                EngineRequest::History { view, back, ack } => {
-                    let _ = ack.send(read_history(view, back));
-                }
+            if !core.serve(request) {
+                core.finish();
+                return;
             }
         }
     }

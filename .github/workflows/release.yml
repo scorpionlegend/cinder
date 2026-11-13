@@ -178,11 +178,13 @@ jobs:
           for v in main main-windowless thread thread-windowless single inproc; do
             p=$(CINDER_CEF_PROBE=$v CINDER_NO_UPDATE_CHECK=1 $bin about:blank 2>&1) && pc=0 || pc=$?
             echo "probe $v exit=$pc"
-            echo "$p" | grep -E "^probe|shim init" | tail -3
+            echo "$p" | grep -E "^probe|shim init" | tail -3 || true
           done
           # `browse` uses the same engine without a window: if it also dies the
           # fault is in initialization, not in the native parent handoff.
-          b=$(CINDER_NO_UPDATE_CHECK=1 timeout 60 $bin browse about:blank 2>&1) && bc=0 || bc=$?
+          # macOS ships no `timeout`, so only bound the run where it exists.
+          if command -v timeout >/dev/null 2>&1; then TO="timeout 60"; else TO=""; fi
+          b=$(CINDER_NO_UPDATE_CHECK=1 $TO $bin browse about:blank 2>&1) && bc=0 || bc=$?
           echo "browse exit=$bc"
           echo "$b" | tail -15
 

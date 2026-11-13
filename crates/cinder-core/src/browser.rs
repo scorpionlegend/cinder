@@ -322,6 +322,7 @@ impl Browser {
 
     /// Drain engine messages, update the model, answer or queue decisions.
     pub fn pump(&mut self) -> Vec<Effect> {
+        self.engine.pump();
         let mut effects = Vec::new();
         for message in self.stream.drain() {
             match message {

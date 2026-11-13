@@ -17,6 +17,11 @@ pub trait Engine: Send + Sync {
     /// arrive as events.
     fn execute(&self, command: Command) -> Result<CommandOutcome, AdapterError>;
 
+    /// Advance the engine by one slice. Implementations that own a thread pump
+    /// themselves and leave this as a no-op; ones that run on the caller's
+    /// thread (CEF on macOS and Windows) need the caller's loop to call it.
+    fn pump(&self) {}
+
     /// Take the single event stream. Implementations return `None` on the
     /// second call so two consumers cannot split the stream.
     fn subscribe(&self) -> Option<EventStream>;

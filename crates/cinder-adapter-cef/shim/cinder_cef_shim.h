@@ -29,7 +29,7 @@ int cinder_cef_init(int argc, char** argv, const char* resources_dir,
                     const char* locales_dir, const char* cache_dir);
 int cinder_cef_init_ex(int argc, char** argv, const char* resources_dir,
                        const char* locales_dir, const char* cache_dir,
-                       int windowless);
+                       int windowless, int external_pump);
 
 /* ------------------------------------------------------------- events --- */
 

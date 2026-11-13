@@ -27,6 +27,7 @@ mod ffi {
             locales_dir: *const c_char,
             cache_dir: *const c_char,
             windowless: c_int,
+            external_pump: c_int,
         ) -> c_int;
         pub fn cinder_cef_create_browser(
             url: *const c_char,
@@ -66,7 +67,7 @@ pub const EV_BLOCKED: i32 = 10;
 mod engine;
 mod runtime;
 
-pub use engine::{measured_capabilities, CefEngine, CefEngineConfig, InputEvent, KeyKind, MouseButton};
+pub use engine::{default_main_thread, measured_capabilities, CefEngine, CefEngineConfig, InputEvent, KeyKind, MouseButton};
 pub use runtime::{prepare as prepare_runtime, root as cef_root, stage as stage_runtime};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -220,6 +221,28 @@ impl Cef {
         extra_args: &[String],
         windowless: bool,
     ) -> Result<Self, CefError> {
+        Self::init_with_args_mode_ex(
+            resources_dir,
+            locales_dir,
+            cache_dir,
+            extra_args,
+            windowless,
+            false,
+        )
+    }
+
+    /// As [`Cef::init_with_args_mode`], but also chooses who owns the message
+    /// loop. `external_pump` makes `CefDoMessageLoopWork` the supported way to
+    /// advance CEF, which is what a host that already runs an event loop on the
+    /// initializing thread needs.
+    pub fn init_with_args_mode_ex(
+        resources_dir: &Path,
+        locales_dir: &Path,
+        cache_dir: &Path,
+        extra_args: &[String],
+        windowless: bool,
+        external_pump: bool,
+    ) -> Result<Self, CefError> {
         let mut args = std::env::args().collect::<Vec<_>>();
         args.extend(extra_args.iter().cloned());
         let mut owned: Vec<CString> = args
@@ -246,6 +269,7 @@ impl Cef {
                 locales.as_ptr(),
                 cache.as_ptr(),
                 windowless as c_int,
+                external_pump as c_int,
             )
         };
         if ok == 1 {

@@ -526,6 +526,9 @@ impl ApplicationHandler for Shell {
         if self.selftest != 0 {
             trace(&format!("tick {} before pump", self.ticks));
         }
+        // Inline engines (CEF on macOS and Windows) only advance when the
+        // thread that owns them pumps; on Linux this is a no-op.
+        self.engine.pump();
         (self.tick)();
         if self.selftest != 0 {
             trace(&format!("tick {} after pump", self.ticks));
