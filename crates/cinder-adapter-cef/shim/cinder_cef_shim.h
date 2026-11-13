@@ -131,6 +131,9 @@ int cinder_cef_set_policy(const char* const* blocked_hosts, int count,
 
 /* Run the CEF message loop for up to `ms` milliseconds. */
 void cinder_cef_pump(int ms);
+/* Drive the pump from a hidden timer window instead of the host's callback.
+ * Windows only; returns 0 elsewhere. */
+int cinder_cef_start_pump_timer(int interval_ms);
 
 /* CEF/Chromium version string, e.g. "158.0.1+g6ee3fb9+chromium-158.0.8127.18". */
 const char* cinder_cef_version(void);

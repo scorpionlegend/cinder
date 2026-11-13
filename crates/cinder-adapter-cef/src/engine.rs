@@ -198,6 +198,10 @@ pub struct CefEngineConfig {
     /// host's event callback runs a nested platform message loop that never
     /// returns.
     pub pump_in_send: bool,
+    /// Whether a hidden timer window drives `cef_do_message_loop_work` instead
+    /// of the host's event loop. Windows only; see
+    /// [`default_pump_timer`].
+    pub pump_timer: bool,
     /// What this build actually provides. Defaults to [`measured_capabilities`].
     pub capabilities: Capabilities,
 }
@@ -219,6 +223,7 @@ impl CefEngineConfig {
             external_pump: default_external_pump(),
             host_pumps: default_host_pumps(),
             pump_in_send: default_pump_in_send(),
+            pump_timer: default_pump_timer(),
             capabilities: measured_capabilities(),
         }
     }
@@ -259,6 +264,15 @@ pub fn default_pump_in_send() -> bool {
     match std::env::var("CINDER_CEF_PUMP_IN_SEND") {
         Ok(value) => value != "0",
         Err(_) => cfg!(target_os = "linux"),
+    }
+}
+
+/// Whether a hidden timer window drives the pump. `CINDER_CEF_PUMP_TIMER=0|1`
+/// overrides it; the shim only has such a window on Windows.
+pub fn default_pump_timer() -> bool {
+    match std::env::var("CINDER_CEF_PUMP_TIMER") {
+        Ok(value) => value != "0",
+        Err(_) => false,
     }
 }
 
@@ -798,6 +812,9 @@ struct EngineCore {
     /// Whether a command may pump inline; see
     /// [`CefEngineConfig::pump_in_send`].
     pump_in_send: bool,
+    /// Whether a timer window owns the pump; see
+    /// [`CefEngineConfig::pump_timer`].
+    pump_timer: bool,
 }
 
 // SAFETY: a core is only ever touched by the thread that initialized CEF —
@@ -828,6 +845,7 @@ impl EngineCore {
                 engine_version: Cef::version(),
             },
         );
+        let pump_timer = config.pump_timer && cef.start_pump_timer(PUMP_MS);
         Ok(Self {
             cef,
             sink,
@@ -836,15 +854,19 @@ impl EngineCore {
             state: EngineState::default(),
             external_pump: config.external_pump,
             pump_in_send: config.pump_in_send,
+            pump_timer,
             host_pumps: config.host_pumps,
         })
     }
 
     fn pump(&mut self) {
-        if self.external_pump && self.host_pumps {
+        if self.external_pump && self.host_pumps && !self.pump_timer {
+            trace("engine pump cef enter");
             self.cef.pump(PUMP_MS);
+            trace("engine pump cef done");
         }
         reconcile(&mut self.state, &self.sink);
+        trace("engine pump reconciled");
     }
 
     /// Handle one request. Returns false once the session has shut down.

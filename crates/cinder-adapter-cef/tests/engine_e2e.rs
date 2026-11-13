@@ -119,6 +119,7 @@ fn config() -> CefEngineConfig {
         external_pump: cinder_adapter_cef::default_external_pump(),
         host_pumps: cinder_adapter_cef::default_host_pumps(),
         pump_in_send: cinder_adapter_cef::default_pump_in_send(),
+        pump_timer: cinder_adapter_cef::default_pump_timer(),
         capabilities: cinder_adapter_cef::measured_capabilities(),
     }
 }

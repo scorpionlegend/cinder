@@ -36,6 +36,7 @@ mod ffi {
             height: c_int,
         ) -> c_int;
         pub fn cinder_cef_pump(ms: c_int);
+        pub fn cinder_cef_start_pump_timer(interval_ms: c_int) -> c_int;
         pub fn cinder_cef_state() -> c_int;
         pub fn cinder_cef_frame_size(width: *mut c_int, height: *mut c_int) -> c_int;
         pub fn cinder_cef_copy_frame(dst: *mut c_uchar, capacity: c_int) -> c_int;
@@ -68,7 +69,7 @@ pub const EV_BLOCKED: i32 = 10;
 mod engine;
 mod runtime;
 
-pub use engine::{default_external_pump, default_host_pumps, default_main_thread, default_pump_in_send, measured_capabilities, CefEngine, CefEngineConfig, InputEvent, KeyKind, MouseButton};
+pub use engine::{default_external_pump, default_host_pumps, default_main_thread, default_pump_in_send, default_pump_timer, measured_capabilities, CefEngine, CefEngineConfig, InputEvent, KeyKind, MouseButton};
 pub use runtime::{prepare as prepare_runtime, root as cef_root, stage as stage_runtime};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -320,6 +321,13 @@ impl Cef {
         // SAFETY: must be called on the initializing thread; the type is not
         // Send/Sync so it cannot be moved to another thread.
         unsafe { ffi::cinder_cef_pump(ms as c_int) }
+    }
+
+    /// Hand the pump to a hidden timer window. Returns false where the shim has
+    /// no such window, in which case the host keeps calling [`Cef::pump`].
+    pub fn start_pump_timer(&self, interval_ms: u32) -> bool {
+        // SAFETY: must be called on the initializing thread, like `pump`.
+        unsafe { ffi::cinder_cef_start_pump_timer(interval_ms as c_int) == 1 }
     }
 
     pub fn state(&self) -> i32 {

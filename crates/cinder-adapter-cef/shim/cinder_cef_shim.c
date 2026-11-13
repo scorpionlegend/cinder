@@ -87,6 +87,9 @@ static int g_upgrade_https = 0;
 /* Set from cef_settings_t.external_message_pump: cef_do_message_loop_work is
  * only valid when the host owns the loop. */
 static int g_external_pump = 1;
+/* Non-zero once a hidden window's WM_TIMER drives the pump; the host then
+ * leaves cinder_cef_pump alone. */
+static int g_pump_timer = 0;
 
 /* Guards the policy copy and the browser→view lookup, both of which are read
  * from CEF's IO thread while the engine thread mutates them.
@@ -395,6 +398,7 @@ static int CEF_CALLBACK life_do_close(struct _cef_life_span_handler_t* self,
                                       struct _cef_browser_t* browser) {
   cinder_view_t* v = view_by_browser(browser);
   (void)self;
+  trace("do_close", v ? (long)v->id : -1, 0);
   if (v) {
     emit(v->id, CINDER_CEF_EV_CLOSE_REQUESTED, NULL, NULL);
   }
@@ -477,6 +481,7 @@ static void CEF_CALLBACK load_on_loading_state_change(
   if (!v) {
     return;
   }
+  trace("load state", (long)v->id, (long)isLoading);
   if (isLoading) {
     v->state &= ~CINDER_CEF_LOADED;
     emit(v->id, CINDER_CEF_EV_LOAD_START, v->url, NULL);
@@ -540,6 +545,7 @@ static void CEF_CALLBACK display_on_address_change(
     return;
   }
   to_utf8(url, v->url, sizeof(v->url));
+  trace("address", (long)v->id, 0);
   emit(v->id, CINDER_CEF_EV_URL, v->url, NULL);
 }
 
@@ -1431,12 +1437,82 @@ void cinder_cef_pump(int ms) {
   if (!g_external_pump) {
     return;
   }
+  /* A timer window owns the pump in this mode. */
+  if (g_pump_timer) {
+    return;
+  }
+  trace("pump enter", ms, 0);
   while (elapsed < ms) {
+    trace("pump work enter", elapsed, 0);
     cef_do_message_loop_work();
+    trace("pump work done", elapsed, 0);
     sleep_ms(1);
     elapsed += 1;
   }
+  trace("pump done", elapsed, 0);
 }
+
+#ifdef _WIN32
+/* Set while a pump call is on the stack, so a timer that fires inside CEF's
+ * own dispatch does not re-enter cef_do_message_loop_work. */
+static int g_in_pump = 0;
+
+static LRESULT CALLBACK pump_window_proc(HWND hwnd, UINT msg, WPARAM wp,
+                                         LPARAM lp) {
+  (void)lp;
+  if (msg == WM_TIMER) {
+    if (!g_in_pump) {
+      g_in_pump = 1;
+      cef_do_message_loop_work();
+      g_in_pump = 0;
+    }
+    return 0;
+  }
+  return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+/* Drive CEF from a hidden message-only window instead of the host's callback.
+ * The timer message is dispatched by whichever loop is running, so the pump
+ * never sits inside the host's own event handler. */
+int cinder_cef_start_pump_timer(int interval_ms) {
+  static const wchar_t* kClass = L"CinderCefPump";
+  WNDCLASSEXW wc;
+  HWND hwnd;
+  UINT_PTR id;
+
+  if (g_pump_timer) {
+    return 1;
+  }
+  memset(&wc, 0, sizeof(wc));
+  wc.cbSize = sizeof(wc);
+  wc.lpfnWndProc = pump_window_proc;
+  wc.hInstance = GetModuleHandleW(NULL);
+  wc.lpszClassName = kClass;
+  if (!RegisterClassExW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+    trace("pump timer class failed", (long)GetLastError(), 0);
+    return 0;
+  }
+  hwnd = CreateWindowExW(0, kClass, L"", 0, 0, 0, 0, 0, HWND_MESSAGE, NULL,
+                         wc.hInstance, NULL);
+  if (!hwnd) {
+    trace("pump timer window failed", (long)GetLastError(), 0);
+    return 0;
+  }
+  id = SetTimer(hwnd, 1, (UINT)(interval_ms > 0 ? interval_ms : 4), NULL);
+  if (!id) {
+    trace("pump timer failed", (long)GetLastError(), 0);
+    return 0;
+  }
+  g_pump_timer = 1;
+  trace("pump timer installed", interval_ms, (long)id);
+  return 1;
+}
+#else
+int cinder_cef_start_pump_timer(int interval_ms) {
+  (void)interval_ms;
+  return 0;
+}
+#endif
 
 int cinder_cef_view_state(int view_id) {
   cinder_view_t* v = view_by_id(view_id);
