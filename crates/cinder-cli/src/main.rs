@@ -25,10 +25,18 @@ fn version_string() -> &'static str {
 }
 
 fn main() {
+    // A crash inside CEF leaves no output at all when stdout is a pipe, so the
+    // selftest writes its first line to stderr before anything else runs.
+    if std::env::var_os("CINDER_WINDOW_SELFTEST").is_some() {
+        eprintln!("window trace: main entered, argv={:?}", std::env::args().collect::<Vec<_>>());
+    }
     // CEF re-executes this binary for its subprocesses; they must exit before
     // any argument parsing so a helper process never runs a command.
     #[cfg(feature = "cef")]
     if let Some(code) = cinder_adapter_cef::Cef::execute_process() {
+        if std::env::var_os("CINDER_WINDOW_SELFTEST").is_some() {
+            eprintln!("window trace: subprocess exit {code}");
+        }
         std::process::exit(code);
     }
 
