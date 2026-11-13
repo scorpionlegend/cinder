@@ -37,6 +37,14 @@ use winit::window::{Window, WindowId};
 /// How often the loop wakes to pump the engine and repaint.
 const TICK: Duration = Duration::from_millis(16);
 
+/// Progress notes for `CINDER_WINDOW_SELFTEST`. They go to stderr, which is
+/// unbuffered, so a crash still leaves a trail of how far the window got.
+fn trace(message: &str) {
+    if std::env::var_os("CINDER_WINDOW_SELFTEST").is_some() {
+        eprintln!("window trace: {message}");
+    }
+}
+
 /// Why the window could not run.
 #[derive(Debug)]
 pub enum WindowError {
@@ -396,12 +404,17 @@ impl ApplicationHandler for Shell {
             height: view_height,
             scale,
         };
+        trace(&format!(
+            "window ready: handle={handle:#x} size={}x{} view_height={view_height}",
+            size.width, size.height
+        ));
         let view = self.open.take().and_then(|open| open(parent));
         let Some(view) = view else {
             eprintln!("cinder: could not create the page");
             event_loop.exit();
             return;
         };
+        trace(&format!("view created: {view:?}"));
         self.view = Some(view);
         self.last_size = (size.width, size.height);
         self.chrome.scale = scale;

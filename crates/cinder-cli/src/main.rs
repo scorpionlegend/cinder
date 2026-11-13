@@ -515,6 +515,13 @@ fn run_open(target: Option<&str>) -> i32 {
         }
     };
 
+    // The window may abort inside CEF; flush now so the lines above survive.
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    if std::env::var_os("CINDER_WINDOW_SELFTEST").is_some() {
+        eprintln!("window trace: engine started");
+    }
+
     let policy = Arc::new(PolicySnapshot::new(1).with_https_upgrade(true));
     let profile = std::env::temp_dir().join("cinder-window-profile");
     let profile = profile.to_string_lossy().into_owned();

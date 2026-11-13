@@ -323,8 +323,59 @@ pub fn macos_entries(input: &BundleInput<'_>) -> io::Result<Vec<Entry>> {
         info_plist(input.version),
         0o644,
     ));
+    helper_apps(&app, &mut out);
     out.extend(notices(input.cef_root, input.version, input.cef_version));
     Ok(out)
+}
+
+/// CEF runs its GPU, renderer and plugin processes as helper apps on macOS.
+/// Without them the browser aborts with "GPU process isn't usable", so the
+/// four bundles are generated here rather than copied from the distribution.
+fn helper_apps(app: &str, out: &mut Vec<Entry>) {
+    for (name, id) in [
+        ("Cinder Helper", "io.cinder.helper"),
+        ("Cinder Helper (GPU)", "io.cinder.helper.gpu"),
+        ("Cinder Helper (Renderer)", "io.cinder.helper.renderer"),
+        ("Cinder Helper (Plugin)", "io.cinder.helper.plugin"),
+    ] {
+        let base = format!("{app}/Frameworks/{name}.app/Contents");
+        out.push(Entry::dir(format!("{app}/Frameworks/{name}.app"), 0o755));
+        out.push(Entry::dir(base.clone(), 0o755));
+        out.push(Entry::dir(format!("{base}/MacOS"), 0o755));
+        // The helper executable is the main binary; CEF re-execs it with
+        // --type=... and the process type decides what it does.
+        out.push(Entry::symlink(
+            format!("{base}/MacOS/{name}"),
+            "../../../../MacOS/cinder",
+        ));
+        out.push(Entry::bytes(
+            format!("{base}/Info.plist"),
+            helper_plist(name, id),
+            0o644,
+        ));
+    }
+}
+
+fn helper_plist(name: &str, id: &str) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleName</key><string>{name}</string>
+  <key>CFBundleIdentifier</key><string>{id}</string>
+  <key>CFBundleExecutable</key><string>{name}</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleSignature</key><string>????</string>
+  <key>CFBundleVersion</key><string>1.0</string>
+  <key>LSMinimumSystemVersion</key><string>11.0</string>
+  <key>NSHighResolutionCapable</key><true/>
+  <key>NSPrincipalClass</key><string>NSApplication</string>
+  <key>NSSupportsAutomaticGraphicsSwitching</key><true/>
+</dict>
+</plist>
+"#
+    )
 }
 
 fn walk(dir: &Path, prefix: &str, out: &mut Vec<Entry>) -> io::Result<()> {
